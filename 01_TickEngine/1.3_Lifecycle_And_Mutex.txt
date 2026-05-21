@@ -1,0 +1,309 @@
+markdown复制# MDU 1.3: 生命周期幂等保护与双重启动 Mutex 防御
+
+## 任务目标
+
+在 MDU 1
+.2 双轨 Flow 的基础上，为 `TickEngine` 的 `start()` 方法装配 `Mutex` 并发启动防御锁，实现幂等重置语义，并完善 `stop()` 方法的清理状态全归零逻辑。
+
+**输出标准**：代码必须通过 Kotlin 编译，`start()` 使用 `Mutex.withLock` 包裹所有启动动作，`stop()` 执行后所有状态归零。
+
+---
+
+## 1. 生命周期 API 契约
+
+### 1.1 start(initialTick: Long = 0)
+
+**签名**：fun start(initialTick: Long = 0)
+
+**功能描述**：初始化并启动 TickEngine，使用 Mutex 确保多线程并发调用时的严格排他性，防止双重启动。
+
+**并发安全语义**：
+- 使用 startMutex.withLock { ... } 包裹全部启动动作
+- 任意时刻只允许一个线程执行启动逻辑
+- 其他并发调用线程在锁外排队等待
+
+**幂等重置语义**：
+- 调用 start() 前，先执行 stop() 清理旧资源（新协程不会叠加旧协程）
+- currentTickId 被设置为 initialTick（从指定 Tick ID 重新开始）
+
+**行为约束**：
+- initialTick 允许任意非负整数，默认为 0
+- 若引擎已在运行，再次调用 start() 会先停止再重新启动（幂等重置）
+- 启动成功后，isEnginePaused 必须为 false
+- 启动成功后，isLogicPaused 必须为 false
+
+**返回值**：Unit
+
+---
+
+### 1.2 stop()
+
+**签名**：fun stop()
+
+**功能描述**：停止引擎，释放协程资源，并强制归零所有暂停状态。
+
+**清理动作**：
+1. engineJob?.cancel(); engineJob = null — 取消并置空协程任务
+2. isEnginePaused.set(false) — 强制归零引擎暂停标志
+3. isLogicPaused.set(false) — 强制归零逻辑暂停标志
+
+**幂等语义**：
+- 若引擎未在运行（engineJob == null），调用 stop() 应无操作
+- 若引擎已在运行，调用后进入停止状态
+
+**状态归零保证**：
+- stop() 执行后，无论此前调用过多少次 pauseEngine() 或 pauseLogic()
+- 下次调用 start() 时，isEnginePaused 和 isLogicPaused 均为 false
+
+**返回值**：Unit
+
+---
+
+## 2. 完整 start() 实现
+
+```kotlin
+fun start(initialTick: Long = 0) {
+    startMutex.withLock {
+        // 步骤 A：清理旧资源，防止协程叠加（注意：内部已无锁调用清理逻辑）
+        stopInternal()
+
+        // 步骤 B：重置逻辑起点与累加器
+        currentTickId.set(initialTick)
+        accumulator = 0L
+
+        // 步骤 C：标记引擎运行状态（全停和逻辑暂停均归零）
+        isEnginePaused.set(false)
+        isLogicPaused.set(false)
+
+        // 步骤 D：申请新的后台协程
+        engineJob = scope.launch {
+            // 50ms UI 心跳循环（MDU 1.2 已定义）
+            while (isActive) {
+                delay(50L)
+                if (!isEnginePaused.get()) {
+                    _realTickFlow.tryEmit(System.currentTimeMillis())
+                }
+            }
+        }
+    }
+}
+```
+
+## 3. 完整 stop() 实现
+
+```kotlin
+fun stop() {
+    startMutex.withLock {
+        stopInternal()
+    }
+}
+
+private fun stopInternal() {
+    // 步骤 A：Job 清理（幂等：null 时无操作）
+    engineJob?.cancel()
+    engineJob = null
+
+    // 步骤 B：双标志位强制归零
+    isEnginePaused.set(false)
+    isLogicPaused.set(false)
+}
+```
+4. 禁止事项（硬性约束）
+4.1 资源泄漏红线
+❌ 启动前不清理 → 旧协程残留叠加
+在 start() 内部申请新协程前，必须先调用 stop()。若跳过此步骤：
+
+旧 engineJob 协程仍在运行，持续发射 realTickFlow
+新协程启动后，两个发射源叠加
+realTickFlow 订阅者收到双倍心跳，无法正确计时
+
+4.2 状态残留红线
+❌ stop() 后不归零 → 暂停状态污染下次启动
+stop() 执行后，必须强制设置 isEnginePaused = false 和 isLogicPaused = false。若跳过此步骤：
+
+下次调用 start() 时带着残留的暂停状态运行
+realTickFlow 和 tickFlow 永久沉默
+等待一个永远不会到来的 resume() 呼叫（因为调用者认为引擎已在运行）
+
+4.3 并发竞态红线
+❌ start() 不使用 Mutex → 双重启动竞态
+多线程并发调用 start() 时：
+
+可能同时创建多个 engineJob 协程
+currentTickId 出现写冲突
+导致不可预期的双写脑裂
+
+5. Mutex 防御机制详解
+5.1 Mutex.withLock 结构
+kotlin复制private val startMutex = Mutex()
+
+fun start(initialTick: Long = 0) {
+    startMutex.withLock {
+        // 只有一个线程能进入此区块
+        // 其他线程在此排队等待
+    }
+}
+5.2 并发场景分析
+50 线程同时调用 start()：
+
+无 Mutex 结果：50 个协程叠加，双倍心跳
+有 Mutex 结果：1 个成功，其余排队后执行 stop→start
+
+线程 A 在 start() 中，线程 B 调用 start()：
+
+无 Mutex 结果：可能同时修改 currentTickId
+有 Mutex 结果：B 在锁外等待，A 执行完后 B 进入
+
+线程 A 在 start() 中，线程 B 调用 stop()：
+
+无 Mutex 结果：B 可能取消还在创建中的协程
+有 Mutex 结果：B 在锁外等待，或取消已创建的协程
+
+6. 测试规范：TickEngineLifecycleTest.kt
+6.1 测试原则
+⚠️ 黑盒测试强制规则：禁止使用反射或访问 engineJob 私有字段。所有验证必须通过公开 API 反映。
+6.2 测试用例
+T01：多协程并发启动抗压防御测试
+
+目的：验证 50 个线程并发调用 start() 时不会产生双重启动
+步骤：
+
+准备 50 个协程的启动任务列表
+在 Dispatchers.Default 上并发执行：repeat(50) { scope.launch { engine.start(100L) } }
+等待所有协程完成：joinAll()
+推进虚拟时间：advanceTimeBy(200)（确保至少 2 个心跳周期）
+调用 getCurrentTickId() 获取最终值
+
+
+断言：
+
+A1：所有 50 个协程正常完成，无异常、无死锁
+A2：getCurrentTickId() 严格等于 100L（证明最终正确重置）
+
+
+通过标准：无并发异常，TickId 为预期起始值
+
+T02：停止后状态强制归零测试
+
+目的：验证 stop() 正确归零所有暂停状态
+步骤：
+
+调用 start()
+调用 pauseEngine() → 验证 isEnginePaused() == true
+调用 pauseLogic() → 验证 isLogicPaused() == true
+调用 stop()
+调用 isEnginePaused()
+调用 isLogicPaused()
+
+
+断言：
+
+A1：isEnginePaused() 严格等于 false
+A2：isLogicPaused() 严格等于 false
+
+
+通过标准：两个标志位均归零
+
+T03：幂等重置测试
+
+目的：验证重复调用 start() 不会累积协程
+步骤：
+
+获取当前心跳数：val count1 = currentRealTickCount()
+调用 start()（重新启动）
+推进虚拟时间：advanceTimeBy(100)
+获取重启后心跳数：val count2 = currentRealTickCount()
+
+
+断言：
+
+A1：重启后心跳从 0 开始累积（不继承旧的累积计数）
+A2：重启后 TickId 从 initialTick（默认 0）重新计数
+
+
+通过标准：幂等重置，无协程叠加
+
+T04：stop 幂等性测试
+
+目的：验证多次调用 stop() 不会异常
+步骤：
+
+调用 start()
+调用 stop()
+再次调用 stop()
+第三次调用 stop()
+
+
+断言：
+
+A1：所有 stop() 调用均正常返回，无异常
+A2：状态保持归零（isEnginePaused() == false）
+
+
+通过标准：幂等执行
+
+T05：残留暂停状态污染测试
+
+目的：验证带着残留暂停状态启动会导致心跳沉默（负面测试）
+步骤：
+
+start() → pauseEngine() → stop()（此时 isEnginePaused 应归零）
+再次 start()
+推进时间：advanceTimeBy(100)
+收集心跳
+
+
+断言：
+
+A1：重启后心跳正常发射（isEnginePaused == false 时）
+A2：getCurrentTickId() 为非负值（引擎在运行）
+
+
+通过标准：无残留污染
+
+7. 测试框架要求
+
+使用 kotlinx.coroutines.test.TestScope 或 TestCoroutineScope
+使用 Dispatchers.setMain 替换默认调度器以支持测试
+使用 kotlin.test 断言库
+每个测试方法独立，无执行顺序依赖
+并发测试使用 Dispatchers.Default 显式创建多线程环境
+
+8. 输出要求
+
+仅输出 Kotlin 代码文件（TickEngine.kt 更新 + TickEngineLifecycleTest.kt）
+包含：start() Mutex 排他锁、stop() 双标志位归零
+不包含：GameTick 累加逻辑、时段换算
+代码格式：遵循 Kotlin 官方约定
+
+9. 快速行为查阅
+启动序列（单线程）：
+code复制start()
+  → startMutex.withLock {
+      stop()                     // 清理旧资源
+      currentTickId.set(x)       // 重置 Tick
+      isEnginePaused.set(false)  // 归零标志
+      isLogicPaused.set(false)
+      engineJob = scope.launch { ... }  // 新协程
+    }
+并发场景：
+
+线程1: start() → 获得锁 → 执行中…
+线程2: start() → 等待锁…
+线程3: start() → 等待锁…
+（线程1执行完，线程2/3依次获得锁执行，线程2的start会先调用stop清理线程1的job）
+
+停止序列：
+code复制stop()
+  → engineJob?.cancel()
+  → engineJob = null
+  → isEnginePaused.set(false)
+  → isLogicPaused.set(false)
+10. 与 MDU 1.2 的边界说明
+双轨 SharedFlow 声明 + 背压策略：MDU 1.2
+50ms UI 心跳循环 + tryEmit：MDU 1.2
+start() / stop() API 骨架：MDU 1.1
+start() Mutex 排他锁：MDU 1.3（本章）
+stop() 双标志位归零：MDU 1.3（本章）
+GameTick 累加逻辑 + tickFlow 发射：MDU 1.4（下一模块）
+时段换算（TimePeriod）：MDU 1.4（下一模块）

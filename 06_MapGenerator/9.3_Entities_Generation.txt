@@ -1,0 +1,83 @@
+# MDU 9.3: 确定性怪物生成与动态等级保底 (MDU-C: Monster Procedural Gen)
+
+作为 AI 算法与程序生成专家，你的任务是为延迟地图格子开发“确定性野怪生成机制”以及与空间距离挂钩的“野怪等级演进与保底公式”。
+
+---
+
+## 1. 怪物生成与等级演进契约 (Interface Contract)
+
+在生成器中内置野怪种类判定器及等级算力公式（确保相同的坐标产生相同的战役）：
+
+```kotlin
+// 存放野怪生成结果
+data class GeneratedMonster(
+    val monsterTypeId: String,
+    val level: Int
+)
+
+// 基于地形、圈层及空间距离，确定性生成野怪数据
+// 返回 null 代表该地块不刷怪
+fun generateMonster(seed: Long, x: Int, y: Int, terrainTypeId: String, zone: MapZone): GeneratedMonster?
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **大本营安全区刷怪红线 (No Monster on Camp)**：
+   **绝对禁止**在大本营地形（`BASE_CAMP`）及城邦（`CITY_STATE`）内生成任何普通怪物，确保领地中心及交易口岸的绝对物理安全。
+2. **禁止出现等级零或负数**：等级计算必须使用 `coerceAtLeast(1)` 进行保底，防止负数等级拖垮战斗引擎。
+
+### 机械式步骤指令：
+1. **是否刷怪判定 (`generateMonster`)**：
+   - 步骤 A：地形校验。若 `terrainTypeId` 为 `"BASE_CAMP"` 或 `"CITY_STATE"`，直接返回 `null`。
+   - 步骤 B：**刷怪概率门槛核算**：
+     - 利用不同的扰动种子进行哈希：`val spawnRoll = hash(seed + 2L, x, y) % 100`。
+     - 根据 `zone`（MapZone）决定概率阈值：
+       - `MapZone.STARTER_ZONE` $\rightarrow$ 阈值 $60\%$（即 $spawnRoll < 60$ 刷怪）
+       - `MapZone.MID_ZONE` $\rightarrow$ 阈值 $70\%$
+       - `MapZone.HIGH_ZONE` $\rightarrow$ 阈值 $80\%$
+       - `MapZone.ABYSS_ZONE` $\rightarrow$ 阈值 $90\%$
+     - 若 $spawnRoll$ 大于等于阈值，直接无害返回 `null`（地块安全）。
+2. **怪物类型按地形矩阵匹配**：
+   - 根据 $terrainTypeId$ 与 $zone$ 交叉比对，决定种类（建立映射表）：
+     - `PLAINS` $\rightarrow$ 新手: `"SLIME"` | 中级: `"GOBLIN"` | 高级: `"BANDIT"` | 深渊: `"DARK_KNIGHT"`
+     - `FOREST` $\rightarrow$ 新手: `"GOBLIN"` | 中级: `"WOLF"` | 高级: `"WOLF"` | 深渊: `"DARK_KNIGHT"`
+     - `MOUNTAIN` $\rightarrow$ 新手: `"GOBLIN"` | 中级: `"WOLF"` | 高级: `"SKELETON"` | 深渊: `"DARK_KNIGHT"`
+     - `SWAMP` $\rightarrow$ 新手: `"SLIME"` | 中级: `"SKELETON"` | 高级: `"SKELETON"` | 深渊: `"DARK_KNIGHT"`
+     - `RUINS` $\rightarrow$ 新手: `"SKELETON"` | 中级: `"SKELETON"` | 高级: `"BANDIT"` | 深渊: `"DARK_KNIGHT"`
+     - `VOLCANO` $\rightarrow$ 高级/深渊均为 `"LAVA_GIANT"` (其余返回 `null`)
+     - `TUNDRA` $\rightarrow$ 高级/深渊均为 `"FROST_WITCH"` (其余返回 `null`)
+3. **空间距离等级动态演进公式**：
+   - 基础等级 $L_{base}$：新手 1，中级 3，高级 5，深渊 7。
+   - 距离加益 $L_{dist} = \lfloor d / 5 \rfloor$（即每远离大本营 5 格，等级自动提升 1 级）。
+   - 确定性随机扰动 $L_{offset} = (hash(seed + 3L, x, y) \% 3 - 1).toInt()$（扰动值为 $-1$, $0$ 或 $1$）。
+   - 组装最终等级：
+     $$L_{final} = (L_{base} + L_{dist} + L_{offset}).coerceAtLeast(1)$$
+
+---
+
+## MDU 9.3-TEST: 确定性怪物类型匹配与等级保底算法测试
+
+编写单元测试 `MapGenMonsterTest.kt`。
+
+### 机械式测试用例：
+1. **大本营及城邦绝对无怪拦截测试**：
+   - 设定地形为 `"BASE_CAMP"`，调用 `generateMonster`。
+   - **断言 1**：返回 `null`。
+   - 设定地形为 `"CITY_STATE"`，调用。
+   - **断言 2**：返回 `null`。
+2. **怪物类型按地形圈层精准匹配测试**：
+   - 设定地形为 `"VOLCANO"`，在新手圈 `STARTER_ZONE` 进行生成。
+   - **断言 1**：返回 `null`（新手圈不存在火山怪物）。
+   - 在深渊圈 `ABYSS_ZONE` 生成，且判定为刷怪。
+   - **断言 2**：返回的怪物类型必须是 `"LAVA_GIANT"`。
+3. **距离演进等级与 1级保底测试**：
+   - 在高级圈（$d = 13.0$，基础等级 5，$L_{dist} = 2$），令摇点扰动值产生 $-1$ 的负面衰减。
+   - **断言 1**：怪物等级最终应为 $5 + 2 - 1 = 6$ 级。
+   - 在新手圈（$d = 1.0$，基础等级 1），人为令哈希产生 $-1$ 的摇点衰减。
+   - **断言 2**：最终等级依然被强力保底，精准为 `1` 级，绝不出现 0 级小怪。
+
+### 交付物：
+只包含 `generateMonster` 计算结算方法实现、距离等级加成保底计算、以及对应怪物品类和等级保底的 JUnit 单元测试。不含任何大本营固定模板、Boss生成及城邦去重。

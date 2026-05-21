@@ -1,0 +1,68 @@
+# MDU 10.4: 协程高并发气候变迁与防崩溃数值限幅压测 (MDU-D: Concurrency & Stress Tests)
+
+作为 AI 天气模拟与系统压测专家，你的任务是为 `WeatherEngine` 构建高密度的多协程并发天候流转性能回归契约，验证在极高线程写压迫下状态机的非零死锁安全性，以及全局物产修正系数的边界防御限幅。
+
+---
+
+## 1. 核心高并发与边界防御契约 (Stress & Safety Contract)
+
+本 MDU 为纯回归测试与安全断言整合层，对引擎并发修改进行强硬的线程安全测试，并在极端流转下维护以下物理防御系数规范：
+
+```kotlin
+// 数值范围极限限幅安全线：
+// 所有产量及消耗倍率必须严格在 (0.0f, 5.0f] 范围内，fogVisionReduction 视野缩减格数必须在 [0, 5] 之间。
+// 以防止因算力异常爆出 Infinity 或负数破坏外部资源公式。
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **多线程死锁及脏读红线 (Concurrent Non-Blocking Redline)**：
+   由于全局有多个村民、商队和 ActionProcessor 不断高频并发读取 `getModifiers()`，同时游戏时钟在另一条线程并发触发 `processTick()`。状态容器**必须完全避免采用全局 Synchronized 重量级锁锁死**，必须全部基于 CAS 原子类完成，防止大后期领地村民一多出现卡死崩溃。
+2. **禁止产生非物理虚数**。
+
+### 机械式步骤指令：
+1. **实现多协程高频并发读写回归测试**：
+   - 步骤 A：在一个高并发测试用例中，启动包含 50 个读协程和 20 个写协程的并发池。
+   - 步骤 B：读协程以高频（每毫秒一次）执行 `getModifiers()`。
+   - 步骤 C：写协程并发高频执行 `processTick()` 以滚动时序，同时其他写协程并发调用 `forceSetWeather(...)` 强制修改气候。
+   - 步骤 D：**并发安全断言**：运行 2 秒以上，**断言全程未出现任何 ConcurrentModificationException 或 AtomicReference 脏读穿透**。
+2. **全局修正系数限幅防御校验**：
+   - 遍历 `WeatherType.values()`，模拟各种气候环境。
+   - 动态调用 `getModifiers()` 读取结果。
+   - **防御性断言 1**：所有倍率乘数（`moveSpeedMultiplier`、`outdoorYieldMultiplier` 等）必须 $\ge 0.1f$ 且 $\le 3.0f$。
+   - **防御性断言 2**：视野缩减格数 `fogVisionReduction` 必须 $\ge 0$ 且 $\le 4$（防止致盲溢出）。
+
+---
+
+## MDU 10.4-TEST: 协程写压榨与数值边界防爆回归测试
+
+编写单元测试 `WeatherEngineStressTest.kt`。
+
+### 机械式测试用例：
+1. **极限并发写压榨下零异常测试**：
+   - 实例化 `WeatherEngine`。
+   - 并发启动 100 个轻量级协程：
+     - 其中 50 个协程疯狂调用 `processTick()`。
+     - 另外 50 个协程同时疯狂调用 `forceSetWeather(WeatherType.SANDSTORM, 5)`。
+   - **断言**：执行高密度多程冲击后，引擎状态容器安然无恙，`getCurrentWeather()` 返回合理的非空状态，系统零死锁。
+2. **全天候修正系数防穿透安全断言**：
+   - 提取所有天气的修饰包。
+   - 对每一个 `WeatherModifiers` 进行大比对。
+   - **断言**：无一参数为 `NaN` 或 `Infinity`，各产量加成控制在物理理性阀值内，捍卫领地经济引擎平稳。
+
+---
+
+## 🔒 语义级冻结声明 (Semantic-Level Freeze Declaration)
+
+当本 MDU 及其配套测试完全通过后，`WeatherEngine` 模块核心语义冻结。
+
+### 冻结语义边界：
+1. **修正参数静态封闭**：暴雨 logging (1.5)、干旱 farming (0.3) 等特化系数基准永不动摇，任何二次重构不准发生数值偏移。
+2. **异色流转强硬封锁**：倒计时到期时，换庄逻辑必须强制过滤本色，且时间范围锁死在 8..16 Ticks。
+3. **无锁原子安全**：核心状态读写完全基于 Atomic 引用 CAS 框架，彻底摒弃阻塞型互斥锁。
+
+### 允许进化范围 (Permitted Evolutions)：
+- 允许后续增加天候（如“极光”或“酸雨”）并配置新的 modifiers 特化，但必须满足 modifiers 参数的上限安全范围拦截，且流转模式必须遵守异色防重规则。

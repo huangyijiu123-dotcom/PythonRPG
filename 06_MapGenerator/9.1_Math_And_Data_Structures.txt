@@ -1,0 +1,246 @@
+# MDU 9.1: 伪随机确定性数论哈希与距离分区系统
+
+## 任务目标
+
+为按需延迟地图生成器打造底层的"确定性数学哈希"与"欧氏几何拓扑分区系统"。
+
+**输出标准**：哈希函数必须纯数学实现（禁止 `java.util.Random`）；所有计算必须幂等确定；欧氏距离分区边界精确。
+
+---
+
+## 1. 核心数学与接口契约（不可更改字段名与类型）
+
+### 1.1 Coordinate 数据类
+
+```kotlin
+// 地图网格坐标，实现 HashCode 复用
+data class Coordinate(val x: Int, val y: Int)
+```
+
+### 1.2 GeneratedTile 数据类
+
+```kotlin
+// 延迟生成完成的地块快照
+data class GeneratedTile(
+    val coordinate: Coordinate,
+    val terrainTypeId: String,           // 地形 ID，如 "PLAINS" | "FOREST" | "VOLCANO"
+    val initialExploreStatus: String,    // "UNEXPLORED" | "VISIBLE_UNEXPLORED" | "EXPLORED"
+    val monsterTypeId: String?,          // null 表示无怪物
+    val monsterLevel: Int?,              // 怪物等级
+    val isBossLocation: Boolean,          // 是否生成 Boss 城堡
+    val bossTypeId: String?,             // Boss 种类 ID
+    val cityStateTypeId: String?         // 城邦种类 ID，如 "FARMING" | "MINING" | "TRADING"
+)
+```
+
+### 1.3 MapZone 枚举
+
+```kotlin
+// 欧氏拓扑圈层枚举
+enum class MapZone {
+    BASE_CAMP,     // 大本营中心 d = 0
+    STARTER_ZONE,  // 新手区 0 < d <= 5
+    MID_ZONE,      // 中级环形带 5 < d <= 12
+    HIGH_ZONE,     // 高级环形带 12 < d <= 20
+    ABYSS_ZONE     // 深渊无底洞 d > 20
+}
+```
+
+---
+
+## 2. 机械式步骤指令
+
+### 2.1 确定性伪随机哈希算法
+
+**必须实现纯数学哈希函数**：
+
+```kotlin
+fun hash(seed: Long, x: Int, y: Int): Long {
+    // 高强度位混淆与高素数乘法，阻断相邻坐标的地形连片同质化
+    var h = seed xor (x.toLong() * 3421959L) xor (y.toLong() * 9283711L)
+    h = (h xor (h ushr 32)) * 0xd6e8feb86659fd93L
+    h = (h xor (h ushr 32)) * 0xd6e8feb86659fd93L
+    h = h xor (h ushr 32)
+    return Math.abs(h)
+}
+```
+
+**算法说明**：
+- 采用乘同余或高强度 LCG 数学哈希
+- 确保输入相同的 `(seed, x, y)` 时，返回确定且分布均匀的正整数
+- 使用高素数乘法和位混淆阻断相邻坐标的地形连片同质化
+
+### 2.2 欧式拓扑距离计算
+
+```kotlin
+fun getDistance(x: Int, y: Int): Double {
+    return Math.sqrt((x * x + y * y).toDouble())
+}
+
+fun getDistance(coordinate: Coordinate): Double {
+    return getDistance(coordinate.x, coordinate.y)
+}
+```
+
+### 2.3 圈层判定映射
+
+```kotlin
+fun getZone(coordinate: Coordinate): MapZone {
+    val d = getDistance(coordinate)
+    
+    return when {
+        d == 0.0 -> MapZone.BASE_CAMP
+        d <= 5.0 -> MapZone.STARTER_ZONE
+        d <= 12.0 -> MapZone.MID_ZONE
+        d <= 20.0 -> MapZone.HIGH_ZONE
+        else -> MapZone.ABYSS_ZONE
+    }
+}
+```
+
+**分区边界规则**：
+
+| 距离范围 | 圈层 |
+|---------|------|
+| d == 0.0 | BASE_CAMP |
+| 0.0 < d <= 5.0 | STARTER_ZONE |
+| 5.0 < d <= 12.0 | MID_ZONE |
+| 12.0 < d <= 20.0 | HIGH_ZONE |
+| d > 20.0 | ABYSS_ZONE |
+
+---
+
+## 3. 禁止事项（硬性约束）
+
+1. **外部不确定性随机类强行禁止红线**：在所有程序生成算法中，**绝对禁止使用 Kotlin/Java 自带的 `java.util.Random` 或 `Random.nextInt()`**！这些随机类内部依赖系统微秒级时钟，在不同机器上无法产生一致的地图。所有随机性必须强制通过数论伪随机哈希函数 `hash(seed, x, y)` 计算得出。
+
+2. **禁止除以零**：任何除法操作必须先检查除数是否为零。
+
+3. **禁止使用系统时间作为种子**：哈希种子必须由调用方显式传入，禁止从系统时钟获取。
+
+4. **禁止非确定性计算**：所有数学函数必须纯函数化，相同输入必须产生相同输出。
+
+---
+
+## 4. 测试规范：MapGenMathTest.kt
+
+### 4.1 测试原则
+
+⚠️ 确定性测试强制规则：所有哈希测试必须验证跨线程/跨调用幂等性。
+
+### 4.2 测试用例
+
+**T01：哈希算法绝对幂等确定性测试**
+
+- 目的：验证哈希函数无状态不确定性
+- 步骤：
+  1. 给定种子 `seed = 54321L`
+  2. 在两个相互独立的计算线程中，对坐标 `(42, -99)` 执行 `hash(seed, 42, -99)`
+- 断言：两次计算返回的 Long 哈希值完全相等
+- 通过标准：跨线程幂等性保证
+
+**T02：相邻坐标哈希高度混淆发散测试**
+
+- 目的：验证相邻坐标哈希值分布分化，无地形连片同质化
+- 步骤：
+  1. 执行 `hash(seed, 10, 10)`
+  2. 执行相邻坐标 `hash(seed, 10, 11)`
+  3. 对比 `hash1 % 100` 和 `hash2 % 100`
+- 断言：两个哈希结果的取余值分布高度分化，不出现极小微差
+- 通过标准：地形边界撕裂自然
+
+**T03：欧氏拓扑分区过渡点精确校验**
+
+- 目的：验证分区边界精确（包含边界值）
+- 步骤：
+  1. 计算坐标 `(3, 4)` 的距离（勾股定理：距离 5.0）
+  2. 断言：`getZone(Coordinate(3, 4))` 严格处于 `MapZone.STARTER_ZONE`（d=5.0 包含于 STARTER_ZONE 上界）
+  3. 计算坐标 `(0, 21)` 的距离（距离 21.0）
+  4. 断言：`getZone(Coordinate(0, 21))` 划分为 `MapZone.ABYSS_ZONE`（d>20.0）
+- 通过标准：边界极值精确划分
+
+**T04：大本营中心点验证**
+
+- 目的：验证原点严格映射到 BASE_CAMP
+- 步骤：
+  1. 调用 `getZone(Coordinate(0, 0))`
+- 断言：返回 `MapZone.BASE_CAMP`
+- 通过标准：原点特殊处理正确
+
+**T05：STARTER_ZONE 上边界验证**
+
+- 目的：验证 d=5.0 精确落在 STARTER_ZONE 内
+- 步骤：
+  1. 计算 `(3, 4)` 距离 = 5.0
+  2. 断言：`getZone` 返回 `STARTER_ZONE`
+- 通过标准：边界包含关系正确
+
+---
+
+## 5. 测试框架要求
+
+- 使用 kotlin.test 断言库
+- 并发测试使用 `kotlinx.coroutines` 协程
+- 每个测试方法独立，无执行顺序依赖
+- 禁止使用反射访问私有字段
+
+---
+
+## 6. 输出要求
+
+1. 仅输出 Kotlin 代码文件（MapGenMath.kt + MapGenMathTest.kt）
+2. 包含：Coordinate、GeneratedTile、MapZone、hash 函数、getDistance 函数、getZone 函数
+3. 不包含：大本营模板、怪物生成、城邦生成逻辑
+4. 代码格式：遵循 Kotlin 官方约定
+
+---
+
+## 7. 模块边界说明
+
+**MDU 9.1（本章）**：确定性哈希、欧氏距离分区
+**MDU 9.2（后续）**：地形生成算法
+**MDU 9.3（后续）**：怪物与城邦生成
+**MDU 9.4（后续）**：大本营初始模板
+**MDU 9.5（后续）**：延迟生成与缓存策略
+
+---
+
+## 8. 快速行为查阅
+
+**哈希函数调用**：
+```
+hash(54321L, 42, -99)
+  → var h = 54321L xor (42L * 3421959L) xor (-99L * 9283711L)
+  → h = (h xor (h ushr 32)) * 0xd6e8feb86659fd93L
+  → h = (h xor (h ushr 32)) * 0xd6e8feb86659fd93L
+  → h = h xor (h ushr 32)
+  → return Math.abs(h)  // 确定性正整数
+```
+
+**距离计算**：
+```
+getDistance(3, 4)
+  → Math.sqrt(3*3 + 4*4)
+  → Math.sqrt(9 + 16)
+  → Math.sqrt(25)
+  → 5.0
+```
+
+**圈层判定**：
+```
+getZone(Coordinate(0, 0))
+  → d = 0.0
+  → d == 0.0 → BASE_CAMP
+
+getZone(Coordinate(3, 4))
+  → d = 5.0
+  → d <= 5.0 → STARTER_ZONE
+
+getZone(Coordinate(10, 10))
+  → d ≈ 14.14
+  → d <= 20.0 且 d > 12.0 → HIGH_ZONE
+
+getZone(Coordinate(0, 21))
+  → d = 21.0
+  → d > 20.0 → ABYSS_ZONE
+```

@@ -1,0 +1,78 @@
+# MDU 11.2: 灾难环境权重判定与概率触发引擎 (MDU-B: Contextual Spawning & Rules)
+
+作为 AI 随机事件调度专家，你的任务是为事件管理器植入对接天候环境的“随机突发天灾判定算法”及“多重去重触发规则”。
+
+---
+
+## 1. 灾难触发规则契约 (Trigger Rule Contract)
+
+在 `EventEngine` 中声明并实现以下核心随机触发判定接口（确保逻辑的纯净自洽）：
+
+```kotlin
+// 尝试触发天灾事件（供时钟大循环在每 Tick 前期阶段调用）
+// 根据 conditionProvider 提供的当前世界天候及建筑分布，高精度计算灾难概率并写入活跃列表
+fun tryTriggerEvents()
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **多重同灾爆发污染红线 (No Duplicate Event Spawns)**：
+   对于具有全局持续性及 Boss 影响力的事件（如 `COLD_SNAP` 寒流突袭、`BOSS_RIOT` Boss骚乱），**绝对禁止在列表中同时生成两个及以上相同类型的事件**！在生成前必须先判定 `activeEvents.values.any { it.type == TARGET }`，若已存在则直接过滤拦截，避免灾难状态疯狂重叠导致数值崩坏。
+2. **禁止空值引火**：森林火灾和洪水必须在获取到对应受灾建筑 ID 时才能诱发，无建筑时绝不无中生有。
+
+### 机械式步骤指令：
+1. **概率触发算法实现 (`tryTriggerEvents`)**：
+   - **森林火灾 (FOREST_FIRE) 触发规约**：
+     - 若 `conditionProvider.getCurrentWeather() == "DROUGHT"`：
+       - 读取受灾建筑：`val targetB = conditionProvider.getRandomForestBuilding()`。
+       - 若 $targetB$ 非空，且随机概率命中 $10\%$（即 `Random.nextInt(100) < 10`）：
+         - 创造火灾事件：`ActiveEvent(eventIdGenerator.getAndIncrement(), EventType.FOREST_FIRE, null, null, targetB, remainingTicks = 4, severity = 2)`。
+         - 调用 `registerEvent` 注册事件并向 SharedFlow 广播 `"SPAWNED"`。
+   - **洪水泛滥 (FLOOD) 触发规约**：
+     - 若 `conditionProvider.getCurrentWeather() == "RAIN"`：
+       - 获取受阻农田：`val targetF = conditionProvider.getRandomFarmBuilding()`。
+       - 若 $targetF$ 非空，且随机概率命中 $10\%$（即 `Random.nextInt(100) < 10`）：
+         - 创造洪水：`ActiveEvent(eventIdGenerator.getAndIncrement(), EventType.FLOOD, null, null, targetF, remainingTicks = 4, severity = 2)`。
+         - 注册并广播。
+   - **寒流突袭 (COLD_SNAP) 触发规约**：
+     - 若 `conditionProvider.getCurrentWeather() == "COLD_WAVE"`：
+       - **重复去重校验**：若 `activeEvents.values.none { it.type == EventType.COLD_SNAP }`：
+         - 若随机概率命中 $20\%$（即 `Random.nextInt(100) < 20`）：
+           - 创造寒流：`ActiveEvent(eventIdGenerator.getAndIncrement(), EventType.COLD_SNAP, null, null, null, remainingTicks = 6, severity = 3)`。
+           - 注册并广播。
+   - **Boss 暴动 (BOSS_RIOT) 触发规约**：
+     - 若 `conditionProvider.hasUndefeatedBoss() == true`：
+       - **重复去重校验**：若 `activeEvents.values.none { it.type == EventType.BOSS_RIOT }`：
+         - 若随机概率命中 $5\%$（即 `Random.nextInt(100) < 5`）：
+           - 创造 Boss 骚乱：`ActiveEvent(eventIdGenerator.getAndIncrement(), EventType.BOSS_RIOT, null, null, null, remainingTicks = -1, severity = 5)`（-1 表示无限持续直到被清理）。
+           - 注册并广播。
+
+---
+
+## MDU 11.2-TEST: 环境灾难触发概率与去重碰撞黑盒测试
+
+编写单元测试 `EventEngineTriggerRulesTest.kt`。
+
+### 机械式测试用例：
+1. **干旱环境触发森林火灾精度测试**：
+   - Mock 状态：天候返回 `"DROUGHT"`，森林建筑返回 `1001L`。
+   - 为了击穿 10% 的概率，循环调用 `tryTriggerEvents()` 50次。
+   - **断言 1**：活跃列表中成功诞生了 `EventType.FOREST_FIRE` 火灾。
+   - **断言 2**：受灾建筑 `affectedBuildingId` 精准等于 `1001L`，持续时长为 4 ticks。
+2. **寒流突袭绝对去重测试**：
+   - Mock 状态：天候为 `"COLD_WAVE"`。
+   - 循环调用 `tryTriggerEvents()` 直到触发了第一个寒流事件。
+   - 再次疯狂循环调用 100 次 `tryTriggerEvents()`。
+   - **断言**：活跃列表中有且仅有一个 `EventType.COLD_SNAP` 寒流事件，绝对没有出现重叠双胞胎。
+3. **Boss 暴动无限倒计时与无 Boss 拦截测试**：
+   - Mock 状态：`hasUndefeatedBoss()` 返回 `false`。
+   - 循环调用 100 次 `tryTriggerEvents()`。
+   - **断言 1**：列表中绝对没有产生 `BOSS_RIOT` 骚乱事件（拦截成功）。
+   - 修改 Mock：`hasUndefeatedBoss()` 返回 `true`，触发骚乱。
+   - **断言 2**：诞生的 `BOSS_RIOT` 事件中，其 `remainingTicks` 严格为 `-1`（物理无限命）。
+
+### 交付物：
+只包含 `tryTriggerEvents` 规则环境比对方法实现、概率随机摇号触发、去重防叠逻辑、以及对应灾难概率与去重测试。不含任何 Tick 老化自毁及 resolve 手动解决 API。

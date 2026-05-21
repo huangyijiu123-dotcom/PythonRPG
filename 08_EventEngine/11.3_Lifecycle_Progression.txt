@@ -1,0 +1,75 @@
+# MDU 11.3: 生命周期递减自然老化与手动抢险接口 (MDU-C: Lifecycle & Resolution)
+
+作为 AI 随机事件调度专家，你的任务是为灾难引擎开发“时钟推进自然损减老化器”及村民抢险到达时调用的“手动解决消除灾难结算器”。
+
+---
+
+## 1. 时钟自减与事件消除契约 (Interface Contract)
+
+在 `EventEngine` 中声明并实现以下生命周期流转 API（确保状态变化的一致性与可见度）：
+
+```kotlin
+// 外部中央时钟在每 Tick 推进时，主动调用此接口推进事件自运转
+// 依次触发：环境概率生成检测 -> 现有灾变倒计时递减 -> 到期自清除广播
+fun processTick(tickId: Long)
+
+// 手动抢险消除事件接口
+// 由 ActionProcessor 在检测到村民到达指定抢险点（火场/农田/Boss打败）后调用
+// 返回：是否成功清除事件（已提前消除或不存在返回 false）
+fun resolveEvent(eventId: Long): Boolean
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **无限命事件倒计时递减熔断红线 (No Countdown for Infinite Events)**：
+   在执行 Tick 倒计时自减时，**绝对禁止对 `remainingTicks == -1`（如 BOSS_RIOT 骚乱）的无限事件进行递减**！必须原样保持为 -1，绝对不能将其扣成 -2 甚至归零消失，确保 Boss 只能靠物理清除。
+2. **禁止出现未注销残影**：已被 `resolveEvent` 或 `EXPIRED` 消除的事件，必须在一瞬间从 `activeEvents` 字典中擦除，不得残余。
+
+### 机械式步骤指令：
+1. **实现生命周期自滚动老化 (`processTick`)**：
+   - 步骤 A：天灾概率摇号触发前置调用：执行 `tryTriggerEvents()`。
+   - 步骤 B：**遍历老化扣减**：
+     - 获取当前全部事件副本进行轮询（避免 ConcurrentModificationException）：
+       - 对每个 `ActiveEvent`，若 `remainingTicks > 0`（排除 -1 级无限事件）：
+         - 递减自损：`event.remainingTicks -= 1`。
+         - **老化自注销**：若递减后 `event.remainingTicks <= 0`：
+           - 从字典移出：`activeEvents.remove(event.eventId)`。
+           - 发射广播：`_eventFlow.tryEmit(ActiveEventUpdate(event, "EXPIRED"))`。
+2. **实现手动抢险结算 (`resolveEvent`)**：
+   - 步骤 A：查寻字典定位事件：`val event = activeEvents[eventId]`。
+   - 步骤 B：**注销清除**：
+     - 若 `event != null`：
+       - 从字典物理摘除：`activeEvents.remove(eventId)`。
+       - 广播强消除事件包：`_eventFlow.tryEmit(ActiveEventUpdate(event, "RESOLVED"))`。
+       - 顺利返回 `true`。
+     - 若为 `null`，直接无害返回 `false`。
+
+---
+
+## MDU 11.3-TEST: 灾害时序自然老化与手动抢修消除测试
+
+编写单元测试 `EventEngineResolutionAndLifecycleTest.kt`。
+
+### 机械式测试用例：
+1. **灾难自滚动递减与到期自毁广播测试**：
+   - 注册火灾事件 `eventId = 55L`，持续时长为 3。
+   - 调用一次 `processTick(1)`。
+   - **断言 1**：该事件的 `remainingTicks` 变为了 `2`。
+   - 连续调用 2 次 `processTick(2)`。
+   - **断言 2**：通过 `getActiveEvents()` 查证，该事件已被自动除名。
+   - **断言 3**：Flow 捕获队列中成功收到了一条 action 为 `"EXPIRED"` 的灾难老化寿终正寝的广播。
+2. **无限命 Boss 事件时序免疫测试**：
+   - 注册 Boss 骚乱事件，`remainingTicks` 为 -1。
+   - 连续调用 10 次 `processTick()`。
+   - **断言**：其 `remainingTicks` 依然为 -1，绝对没有遭到任何削减，保卫了无限战斗使命。
+3. **手动抢救抢修强力消除测试**：
+   - 注册洪水事件 `eventId = 88L`。
+   - 立即调用 `resolveEvent(88L)`。
+   - **断言 1**：方法返回 `true`。
+   - **断言 2**：活跃列表即刻放空，且 Flow 收到一发 action 确为 `"RESOLVED"` 的完美抢险大捷广播。
+
+### 交付物：
+只包含 `processTick` 老化更新实现、`resolveEvent` 清除结算方法、以及对应自然老化和抢险注销的 JUnit 单元测试代码。不含基础框架 Provider 接口及概率摇号具体规则。

@@ -1,0 +1,175 @@
+# MDU 17.3: 异常穿透免疫防线与高频事件同步压测
+
+## 任务目标
+
+在中央大循环中验证子模块崩溃时的"异常穿透免疫防线"，并对高频时钟心跳事件下的整个调度器系统做多协程"无死锁高频抗压性能"断言。
+
+**输出标准**：多重崩溃不得穿透 Flow；100 次高频 Tick 不得乱序；高频启停无死锁；Job 引用销毁干净。
+
+---
+
+## 1. 测试规范：CoordinatorStressAndConcurrencyTest.kt
+
+### 1.1 测试原则
+
+⚠️ 高并发压测强制规则：必须使用虚拟时间（VirtualTime）控制计时；MockK verifyOrder 验证无乱序。
+
+### 1.2 测试用例
+
+**T01：多重崩溃混合免死免疫性能测试**
+
+- 目的：验证多点开花式崩溃下依旧获得免死免疫防线
+- 步骤 A：设定多重 Mock 崩坏条件：
+  - `buildingEngine.processTick()` 触发时，强抛 `NullPointerException`
+  - `marketEngine.processTick()` 触发时，强抛 `IllegalStateException`
+- 步骤 B：激活心跳 `startLoop()`，并往 `tickFlow` 注入发射第一个 Tick
+- 断言 1：大总控内部控制台打印两条崩溃捕获异常隔离日志，但外部协程毫无崩溃波纹
+  - 捕获日志 1：`"[COORD_ERROR] Subsystem crash isolated: ..."`（来自 buildingEngine）
+  - 捕获日志 2：`"[COORD_ERROR] Subsystem crash isolated: ..."`（来自 marketEngine）
+- 步骤 C：再次注入发射第二个 Tick 信号
+- 断言 2：顶层 `weatherEngine.processTick()` 在第二轮心跳时依旧圆满触发，证明在多点开花式崩溃下依然 100% 获得免死免疫防线
+- 通过标准：Flow 未断流，多重崩溃被隔离
+
+**T02：百频时钟心跳高负荷非阻塞压测**
+
+- 目的：验证 100 次高频 Tick 在单线程协程队列中按绝对时序顺畅处理
+- 步骤 A：设定高强度领地运行
+- 步骤 B：在 50ms 内疯狂向 `tickFlow` 连续注入并发射 `100` 次 Tick 心跳（模拟高频加速游戏进程或压测模式）
+- 步骤 C：在前台由另一个协程疯狂调用 `stopLoop()` 随即在下一毫秒再次 `startLoop()` 轰炸
+- 断言 1：所有 100 次 Tick 涉及的 10 大层级方法共 1000 次拓扑调用，皆在单线程协程队列中按绝对时序极其顺畅地处理完毕，未发生任何脏读、线程交叉干扰或 `verifyOrder` 乱序
+- 断言 2：高频启停操作无挂起死锁，Job 引用销毁极其干净，系统稳定无漏泄
+- 通过标准：高频压测通过，无死锁无乱序
+
+**T03：崩溃后所有模块恢复执行测试**
+
+- 目的：验证某个子系统崩溃后，下一轮心跳时所有模块仍正常执行
+- 步骤 A：设定 `buildingEngine.processTick()` 抛出 `RuntimeException("BOOM")`
+- 步骤 B：触发第一个心跳，验证异常被捕获
+- 步骤 C：修正 Mock 条件（移除崩溃），重新触发心跳
+- 断言：`buildingEngine.processTick()` 在第二轮正常执行，未被永久熔断
+- 通过标准：崩溃后自动恢复
+
+**T04：高频启停 Job 引用干净销毁测试**
+
+- 目的：验证高频 start/stop 后 activeJob 无泄漏
+- 步骤：
+  1. 在循环中执行 50 次：`startLoop()` → `stopLoop()`
+  2. 记录每次 stopLoop 后 activeJob.get() 是否为 null
+- 断言：50 次操作后，activeJob.get() == null（最后一次 stop 的结果）
+- 通过标准：Job 引用无泄漏
+
+---
+
+## 2. 禁止事项（硬性约束）
+
+1. **多重异常击穿崩溃红线**：无论哪个或哪几个子系统（例如 `buildingEngine` 和 `marketEngine` 同时）发生致命空指针、非法参数或内存耗尽崩溃，**大协调器绝对不能让中央 Flow 发生任何中断或死锁**！必须保证在下一个 Tick 驱动到来时，新一轮拓扑更新从最顶部的环境层百分之百重新开启。
+
+2. **禁止为了处理异常而阻塞当前线程**：必须保证协程的高效非阻塞性。
+
+3. **禁止省略任何防爆网层级**：所有 10 个子模块调用必须被 try-catch 包裹。
+
+---
+
+## 3. 测试框架要求
+
+- 使用 kotlin.test 断言库
+- 使用 MockK 进行打桩和 verifyOrder 验证
+- 并发压测使用 `runBlocking` 和 `launch` 协程
+- 禁止使用反射访问私有字段
+- 性能测试需确保计时精度（使用 System.nanoTime）
+
+---
+
+## 4. 输出要求
+
+1. 仅输出 Kotlin 代码文件（CoordinatorStressAndConcurrencyTest.kt）
+2. 包含：多重崩溃隔离测试、100 次高频 Tick 压测、高频启停 Job 销毁测试
+3. 不包含：GameLoopCoordinator 实现变更
+4. 代码格式：遵循 Kotlin 官方约定
+
+---
+
+## 5. 模块边界说明
+
+**MDU 17.1（已完成）**：生命周期、DI、Job 原子操作
+**MDU 17.2（已完成）**：严格串行管线、异常防爆网
+**MDU 17.3（本章）**：异常穿透免疫、高频压测、语义冻结
+**MDU 17.4（后续）**：性能优化、验收清单
+
+---
+
+## 6. 语义级冻结声明
+
+当本 MDU 及其配套测试完全通过后，`GameLoopCoordinator` 核心语义冻结。
+
+### 6.1 冻结语义边界
+
+1. **五层串行拓扑时序绝对锁死**：
+   1. 环境层 → 2. 长期进度层 → 3. 经济与动态事件层 → 4. 指令行为结算层（需带入最新 Policy 乘数） → 5. 物理同步层
+   - 顺序严禁调换
+
+2. **免死隔离保护**：任何层级组件崩溃抛出异常，绝不允许刺穿 Flow 收集器，大循环在下一次心跳时必须恢复新一轮派发
+
+3. **协程唯一性**：CAS 强锁 activeJob，防双重并发订阅时钟，stopLoop 时原子释放
+
+### 6.2 允许进化范围 (Permitted Evolutions)
+
+- 允许在 10 个子模块中间增加新模块（如"外交系统"或"家园建造模块"）
+- 新模块的 `processTick` 插入点必须准确匹配五层时序框架之一
+- 新模块必须无条件包裹在 try-catch 防爆网内运行
+
+---
+
+## 7. 快速行为查阅
+
+**多重崩溃免死**：
+```
+tickFlow.emit(1001L)
+  → weatherEngine.processTick()  ✓
+  → policyEngine.processTick()    ✓
+  → buildingEngine.processTick()  ✗ NullPointerException
+    → catch 捕获 → println("[COORD_ERROR] ...")
+  → workshopEngine.processTick()  ✓（继续执行）
+  → forgeEngine.processTick()      ✓
+  → eventEngine.processTick()      ✓
+  → marketEngine.processTick()     ✗ IllegalStateException
+    → catch 捕获 → println("[COORD_ERROR] ...")
+  → actionProcessor.processTick() ✓
+  → entityState.emitStateDiff()    ✓
+  → mapData.emitDirtyTiles()       ✓
+
+tickFlow.emit(1002L)  // Flow 仍然存活！
+  → weatherEngine.processTick()   ✓（免死金牌生效）
+  → ...（所有模块继续执行）
+```
+
+**100 次高频 Tick 压测**：
+```
+// 时间线：0ms ~ 50ms 内完成 100 次 Tick
+tickFlow.emit(1)
+tickFlow.emit(2)
+...
+tickFlow.emit(100)
+
+// 并发启停轰炸
+Thread A: startLoop() → stopLoop() → startLoop() → stopLoop() → ...（50 次）
+Thread B: tickFlow.emit(1..100)（独立执行）
+
+// 最终状态：activeJob.get() == null（最后一次 stop 生效）
+```
+
+**verifyOrder 验证（单次 Tick）**：
+```
+verifyOrder {
+    weatherEngine.processTick()
+    policyEngine.processTick()
+    buildingEngine.processTick()
+    workshopEngine.processTick()
+    forgeEngine.processTick()
+    eventEngine.processTick()
+    marketEngine.processTick()
+    actionProcessor.processTick(any())
+    entityState.emitStateDiff()
+    mapData.emitDirtyTiles()
+}
+```

@@ -1,0 +1,71 @@
+# MDU 5.4: 领地建设、贸易物价、制造与科技法令处理器 (MDU-D: Economy, Build, Tech & Policy Command Handlers)
+
+作为 AI 编码助手，你的任务是为游戏上层系统搭建联通建造、科技、法令、制造及铁匠锻造的逻辑桥梁，实现多个核心外部领域引擎的指令消费与资源校验扣减。
+
+---
+
+## 1. 核心指令分派处理器契约 (Interface Contract)
+
+实现一个领地综合经济与生产指令处理器 `EconomyBuildPolicyHandler : CommandHandler`。它负责认领并消费以下指令：
+
+```kotlin
+// canHandle 响应以下上层指令：
+//   BuildBuilding, UpgradeBuilding, StartResearch, EnactPolicy, RecruitAdventurer,
+//   QueueProduction, ForgeEquipment, UpgradeEquipment, RepairEquipment, DismantleEquipment, RepairAllEquipment
+override fun canHandle(command: PlayerCommand): Boolean
+
+override fun handle(command: PlayerCommand)
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **绝对禁止越权重复编写核心业务算法**：
+   **绝对禁止**在 Handler 内部自行计算建造需要什么材料、升级花费多少、铁匠强化暴击概率或是科技解锁的前置树依赖！这些规则纯属各个独立 Engine（BuildingEngine, TechEngine, TechEngine, TechEngine 等）的职能，本 Handler 只扮演**“资源裁判员与通信联络官”**。
+2. **禁止在找不到资源时进行强行建造**：如果所需资源在最近仓库中没有足够的库存，必须在 Handler 级直接拦截，返回 `false` 且保持仓库资源不动，防止资源穿透。
+
+### 机械式步骤指令：
+1. **处理领地建设 (`BuildBuilding` / `UpgradeBuilding`)**：
+   - 步骤 A：调用注入的 `BuildingEngine.getRequiredMaterials(buildingType)` 获取建材配方（例如 `mapOf("WOOD" to 50, "STONE" to 30)`）。
+   - 步骤 B：寻路定位距离建造点坐标 `(x, y)` 物理距离最近且有充足建材的可用仓库。
+   - 步骤 C：如果在该仓库库存内发现某项建材不足，直接拦截本次指令返回 `false`。
+   - 步骤 D：若校验完全满足，挂起调用 `entityState.updateWarehouseInventory` 扣除对应数量的物资配方。
+   - 步骤 E：成功扣除资源后，通知 `buildingEngine.startConstruction(x, y, buildingType)` 进入建设排队，并向总线抛出 `postEvent` 对应通知。
+2. **处理招募冒险者 (`RecruitAdventurer`)**：
+   - 校验玩家全局金币是否足够（例如消耗 200 金币）。若不足直接退回。
+   - 调用 `entityState.updatePlayerGold(-200)`。
+   - 生成唯一自增 ID，随机姓名（如 "ADVENTURER_1"），初始 hp = 100, maxHp = 100, attackPower = 15, level = 1, mp = 10, status = AdventurerStatus.IDLE。
+   - 调用 `entityState.registerAdventurer` 注册新冒险者。
+3. **处理科技与法令委派 (`StartResearch` / `EnactPolicy`)**：
+   - 直接转发调用 `techEngine.startResearch(techId)`，并在成功后扣除对应的科研点数（存储于 global attributes 中）。
+   - 调用 `policyEngine.enactPolicy(policyType, isActive)` 更改法令的全局时效加成乘数。
+4. **处理制造与锻造 (`QueueProduction` / `ForgeEquipment` etc.)**：
+   - 接收到 `QueueProduction` 时，检验材料无误后直接调用 `workshopEngine.enqueue(workshopId, toolType, count)`。
+   - 锻造、修理和拆解时，验证仓库对应的矿石和装备，再委派给 `forgeEngine.forge(...)`。
+
+---
+
+## MDU 5.4-TEST: 经济建造与制造科技黑盒测试
+
+编写单元测试 `EconomyBuildPolicyHandlerTest.kt`。
+
+### 机械式测试用例：
+1. **BuildBuilding 资源校验不足拦截测试**：
+   - 注册容量为 500 的仓库 1，内只存有 `{"WOOD" to 10}`。
+   - 派发指令 `BuildBuilding(x = 2, y = 2, buildingType = "COTTAGE")`（建材配方 Mock 为需要 50 个 WOOD）。
+   - **断言 1**：Handler 拦截该指令，仓库资源不被扣除（依然是 10 个 WOOD）。
+   - **断言 2**：`BuildingEngine.startConstruction` 从未被调用（建造排队未开始）。
+2. **BuildBuilding 资源充足扣减扣减与建造成功启动测试**：
+   - 在上述环境下，初始化仓库 1 存有 `{"WOOD" to 100, "STONE" to 50}`。
+   - 派发指令 `BuildBuilding(2, 2, "COTTAGE")`。
+   - **断言 1**：仓库 1 中的 `"WOOD"` 正确被扣减为 50，`"STONE"` 被扣减为 20。
+   - **断言 2**：`BuildingEngine.startConstruction` 成功接收到了调用指令，证明建造推进。
+3. **招募冒险者金币不足拦截测试**：
+   - 设定玩家全局金币为 50。
+   - 派发指令 `RecruitAdventurer`（需要 200 金币）。
+   - **断言**：玩家金币保持为 50，没有冒险者被注册。
+
+### 交付物：
+只包含 `EconomyBuildPolicyHandler` 类实现、对应的 canHandle/handle 配方校验、金币和仓库材料的原子扣减、向各业务引擎的参数转发、及对应建造材料校验不足/金币不够阻断的 JUnit 黑盒测试。不含任何村民、商队和战斗等自转逻辑。

@@ -1,0 +1,76 @@
+# MDU 5.5: 冒险者派遣、自动战斗与商队贸易处理器 (MDU-E: Adventurer, Combat & Caravan Handlers)
+
+作为 AI 编码助手，你的任务是为《游戏说明书》中的高级动态单元——**冒险者派遣**、**自动战斗系统**及**商队城邦贸易与越境护送**（`AdventureCombatCaravanHandler`）提供高内聚的状态步进、战斗推进及贸易结算处理器。
+
+---
+
+## 1. 核心指令与自转接口契约 (Interface & System Contract)
+
+实现一个缝合了指令分派与时钟推进的处理器：
+`class AdventureCombatCaravanHandler : CommandHandler, ITickableSystem`
+
+### A. 认领响应以下上层指令 (canHandle)：
+- `DispatchAdventurer`, `RecallAdventurer`, `AssignCaravanTarget`, `StartCaravan`, `RecallCaravan`, `TradeWithCityState`
+
+### B. 时钟周期步进结算 (processTick)：
+每次 Tick 收到自转通知时，执行以下三个主要领域的步进驱动与物理战斗逻辑：
+
+#### 1. 冒险者状态步进 (Adventurer Moving Step)
+- 读取所有处于 `MOVING` 状态的冒险者快照。
+- 调用 `PathfindingEngine.findPath`（地形通过性同村民，必须是已探索且无未清理怪物的格子）。
+- 按 `adventurerMoveSpeed`（默认为 3 格/Tick）提取路径前 3 个坐标作为步进点，调用 `entityState.updateAdventurerPosition`。
+- **抵达目标终点**：一旦冒险者 X,Y 等于目的地 `targetX, targetY`，将冒险者状态变更为 `IDLE`（或到达特定遗迹变更为 RECOVERING），向事件总线抛出 `AdventurerReachedTarget` 事件。
+
+#### 2. 商队移动步进与野怪伏击拦截 (Caravan Moving & Monster Ambush)
+- 读取所有状态为 `TRANSPORTING`（运输中）的商队快照。
+- 调用寻路，按 `caravanMoveSpeed`（默认为 1 格/Tick）前进 1 格，更新其 X,Y 位置。
+- **野怪埋伏遭遇判定**：
+  - 每行进一格，检验当前商队所在新坐标点 `(cx, cy)` 在 `GridMapData` 中是否持有 `hasMonster == true` 的标志。
+  - **遭遇野怪**：如果该格子上有未清理怪物，立即将商队状态强制修改为 `RAIDED`（被袭击），停止其继续移动，向事件总线广播 `CombatTriggered` 事件（包含商队 ID、遭遇位置及护卫冒险者 ID `escortAdventurerId`），以通知战斗系统建立自动挂机战斗会话。
+
+#### 3. 自动战斗挂机结算 (Auto Combat Loop)
+- 在 processTick 结束前，遍历所有处于 `FIGHTING` 状态的冒险者，或当前由 CombatEngine 持有的自动战斗挂机 Session 列表。
+- 逐个调用注入的 `CombatEngine.processAutoBattle(sessionId)`。
+- 若返回最新的伤害扣减及状态数据，挂起调用 `entityState.updateAdventurerHp` 扣减冒险者生命值。一旦 Hp 归零，判定死亡或转入重伤。
+
+---
+
+## 2. 商队城邦物理贸易指令结算 (`TradeWithCityState`)
+
+当 Handler 收到玩家或脚本的 `TradeWithCityState(caravanId, cityId, isBuy, item, amount)` 指令时，严格按如下物理规律结算：
+- 步骤 A：校验商队 `caravanId` 存在性。读取其物理位置坐标 `(cx, cy)`。
+- 步骤 B：读取城邦 `cityId` 的物理位置 `(cityX, cityY)`。
+- **坐标重合判定**：如果商队当前所在坐标与城邦坐标**不重合**，代表商队尚未通勤抵达该城邦，直接**拒绝交易拦截返回 `false`**。
+- 步骤 C：若重合，调用注入的 `MarketEngine.calculatePrice(item, amount, isBuy)` 计算最新城邦倾销动态物价 $P_{total}$。
+- 步骤 D：如果为 `Buy`（买入），校验玩家全局金币是否足够支付 $P_{total}$，以及商队当前累计货物重量加 amount 是否超出其 `capacity` 载货量。若任何一项超容不足，直接回滚返回 `false`。
+- 步骤 E：交易原子双写扣减：
+  - 购买成功：扣除全局金币 $P_{total}$，调用 `entityState.updateCaravanCargo` 写入货物 amount。
+  - 卖出成功：扣除商队货物，玩家金币增加 $P_{total}$。
+  - 向总线抛出 `CaravanTradeResult` 事件。
+
+---
+
+## MDU 5.5-TEST: 冒险者步进、商队伏击与贸易黑盒测试
+
+编写单元测试 `AdventureCombatCaravanHandlerTest.kt`。
+
+### 机械式测试用例：
+1. **冒险者步进移动至终点事件测试**：
+   - 注册冒险者 1，状态为 `MOVING`，起点 `(0, 0)`，目标点为 `(0, 5)`。寻路无阻。`adventurerMoveSpeed` 为 3 格/Tick。
+   - 推进第一次 Tick 结算：断言坐标移至 `(0, 3)`。
+   - 推进第二次 Tick 结算：
+     - **断言 1**：坐标移至 `(0, 5)` 目的地。
+     - **断言 2**：冒险者状态重置为 `IDLE`。
+     - **断言 3**：监听到了发射的 `AdventurerReachedTarget` 事件。
+2. **商队行进遭遇野怪伏击拦截测试**：
+   - 注册商队 1，状态为 `TRANSPORTING`，在 `(1, 1)`，目标 `(1, 2)`。`GridMapData` 标记 `(1, 2)` 持有 `hasMonster = true`。
+   - 推进一次自转 Tick。
+   - **断言 1**：商队移到了 `(1, 2)`，但其状态被强力切换为了 `RAIDED`。
+   - **断言 2**：在事件流中接收到了 `CombatTriggered` 遭遇战爆发事件，移动完全中止。
+3. **商队未到达城邦拒绝贸易测试**：
+   - 注册商队 1，在 `(3, 3)`。城邦 2 在坐标 `(5, 5)`。
+   - 派发指令 `TradeWithCityState(caravanId = 1, cityId = 2, isBuy = true, item = "WOOD", amount = 10)`。
+   - **断言**：Handler 直接拒绝拦截（返回 `false`），不发生任何金币与材料扣减，商队背包不变。
+
+### 交付物：
+只包含 `AdventureCombatCaravanHandler` 类实现、冒险者 3 格商队 1 格步进规则、野怪遭遇战 RAIDED 触发、挂机战斗 Hp 同步、城邦贸易坐标重合校验及金币/载货超容拦截逻辑，以及对应黑盒 JUnit 单元测试。不含任何村民自转、科研建筑法令等逻辑。

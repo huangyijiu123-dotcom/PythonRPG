@@ -1,0 +1,90 @@
+# MDU 7.5: 日常自然经济消耗、时序推进与防爆回归测试 (MDU-E: Daily Consumption & Stress Tests)
+
+作为 AI 测试架构师，你的任务是为 `MarketEngine` 建立一个极高吞吐下的日常经济消耗自运转、未来物价趋势预测算法、以及应对恶意并发薅羊毛压力的综合经济稳定性回归契约。
+
+---
+
+## 1. 自然消耗与每日结算时序契约 (Interface Contract)
+
+在经济管理器中声明并实现以下时序时钟推进及自然衰减预测接口：
+
+```kotlin
+// 每日自然消耗结算（外部在游戏每日结束时主动调用）
+// 库存由于每日自消耗而下降，饱和度降低，推动物价动态平稳回升
+fun processDailyConsumption(cityId: Long)
+
+// 预测 N 天后的物价（基于自然消耗率动态推算，不计玩家买卖）
+// 供 Python AI 策略层或前瞻决策展示调用
+fun forecastPrice(cityId: Long, item: String, days: Int): Float
+
+// 对接中央游戏主循环（GameLoopCoordinator 在每 Tick 推进结算时调用）
+fun processTick(tickId: Long)
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **消耗率防爆跌零红线 (Consumption Lower Bound)**：
+   在执行每日消耗扣减时，消耗算法必须防止数值截断或暴跌，采用以下安全自消耗公式：
+   $$Inv_{new} = Inv_{current} - (Inv_{current} \times \text{consumptionRate}).toInt()$$
+   使用 `coerceAtLeast(0)` 锁定，防止库存被扣成负数。
+2. **禁止时序时序错乱**：`processTick` 驱动的自然消耗与信誉恢复必须且仅能在 `tickId % 24 == 0`（即满一整天时）触发，常规 Tick 仅执行 tradeHistory 垃圾清理，防范计算超载。
+
+### 机械式步骤指令：
+1. **实现自然消耗 (`processDailyConsumption`)**：
+   - 步骤 A：定位城邦。若不存在直接返回。
+   - 步骤 B：遍历城邦的库存 `inventory`，对每一个 `item`，读取该物资在 `dailyConsumptionRate` 字典中的自然消耗率 $R_{consume}$（若未配置，默认按 `0.05f` 扣减）。
+   - 步骤 C：计算新库存并写回：
+     $$Inv_{new} = Inv_{current} - \text{round}(Inv_{current} \times R_{consume}).toInt()$$
+     用 `coerceIn(0, maxCapacity)` 限幅。
+2. **实现物价预测算法 (`forecastPrice`)**：
+   - 步骤 A：定位城邦。获取当前物资的 $P_{base}$、$D_{coeff}$ 以及 $Inv_{current}$。
+   - 步骤 B：模拟天数迭代。推算 $N$ 天后该物资的衰减库存：
+     $$Inv_{projected} = Inv_{current} \times (1.0f - R_{consume})^N$$
+     将库存截断并折算为预测饱和度 $S_{projected} = Inv_{projected} / maxCapacity$。
+   - 步骤 C：假定玩家此期间不产生倾销且信誉保持为 1.0f。计算并返回预测单价：
+     $$P_{projected} = P_{base} \times (1.0f + D_{coeff}) \times (1.0f - S_{projected})$$
+3. **对接游戏大时钟 (`processTick`)**：
+   - 步骤 A：遍历所有注册的城邦。调用 `cleanupTradeHistory(city.id, tickId)` 清理滑窗历史。
+   - 步骤 B：时域判定。若 `tickId % 24L == 0L`（满 24 tick 为一天）：
+     - 遍历所有城邦，依次调用 `processDailyConsumption(city.id)`。
+     - 依次调用 `processReputationRecovery(city.id)`。
+
+---
+
+## MDU 7.5-TEST: 经济自转消耗预测与高并发压力回归测试
+
+编写单元测试 `MarketEngineRegressionTest.kt`。
+
+### 机械式测试用例：
+1. **每日自然消耗物价复苏测试**：
+   - 注册城邦，木材库存为 500（饱和度 0.5），消耗率为 0.1（每天扣 10%）。无需求系数，基准价为 100.0f。
+   - 调用 `getPriceInfo` 获得初始价为 $100.0 \times 0.5 = 50.0f$。
+   - 调用 `processDailyConsumption(1)`。
+   - **断言 1**：木材库存变为了 `450`（消耗了 50 个）。
+   - **断言 2**：再次获取当前物价，价格回升到了 `55.0f`（库存变少，饱和度低推动价格回暖）。
+2. **N天价格预测预测精度校验测试**：
+   - 维持上述环境，库存为 500。
+   - 调用 `forecastPrice(cityId = 1, item = "WOOD", days = 3)`。
+   - 理论模拟：3 天后库存为 $500 \times 0.9^3 = 500 \times 0.729 = 364.5$（四舍五入为 365）。饱和度 0.365。价格应为 63.5f。
+   - **断言**：方法计算出的 Float 预测值与理论公式推导的 $63.5f$ 精准吻合（误差极小）。
+3. **每日时序 Tick 结算与 100 协程并发压测校验**：
+   - 启动 100 个并发协程，对同一个城邦高频交叉并发执行 `sell(5)` 与 `buy(2)`，同时在后台模拟 Tick 循环以 `processTick(tickId)` 滚动。
+   - **断言 1**：在极高并发买卖压力交织下，**未触发任何死锁、内存泄露或容量穿透**。
+   - **断言 2**：到了 24Tick 节点时，消耗和信誉自然恢复在并发下原子执行完毕，状态安全。
+
+---
+
+## 🔒 语义级冻结声明 (Semantic-Level Freeze Declaration)
+
+当本 MDU 及其配套测试完全通过后，`MarketEngine` 模块核心语义冻结。
+
+### 冻结语义边界：
+1. **动态物价数学封闭**：查价与预测的核心公式锁定为供需饱和度动态折合，任何玩法进化不能动摇此数学基底。
+2. **反薅羊毛强原子机制**：买卖过程的 maxCapacity 超载物理拦截、5 Ticks 滑窗倾销惩罚及永久城邦记忆修改必须彻底封死。
+3. **时域触发精准度**：日结自然消耗扣除必须严格锁定为 `tickId % 24 == 0` 驱动。
+
+### 允许进化范围 (Permitted Evolutions)：
+- 允许在 CityStateData 中扩展城邦的关税、特殊专长乘数等字段，但不能修改上述三条冻结的核心结算并发与数学物价逻辑。

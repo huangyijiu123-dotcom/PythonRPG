@@ -1,0 +1,316 @@
+# MDU 2.2: 局部属性原子更新与十字视野解锁
+
+## 任务目标
+
+在上一步的基础上，实现单格子局部属性的并发安全更新，以及格子解锁时的十字视野扩散操作。
+
+**输出标准**：所有局部更新必须使用 `computeIfPresent` 槽锁，禁止先读后写覆盖模式；十字视野扩散返回新变为 `VISIBLE_UNEXPLORED` 的邻居列表。
+
+---
+
+## 1. 核心接口契约（不可更改方法签名）
+
+### 1.1 updateExploreStatus(coordinate: Coordinate, status: ExploreStatus): Boolean
+
+```kotlin
+// 仅更新某格子的 exploreStatus 字段（其他字段不变）
+// 格子不存在时返回 false，更新成功返回 true
+fun updateExploreStatus(coordinate: Coordinate, status: ExploreStatus): Boolean
+```
+
+### 1.2 updateMonsterPresence(coordinate: Coordinate, hasMonster: Boolean): Boolean
+
+```kotlin
+// 仅更新某格子的 hasMonster 字段（其他字段不变）
+// 格子不存在时返回 false，更新成功返回 true
+fun updateMonsterPresence(coordinate: Coordinate, hasMonster: Boolean): Boolean
+```
+
+**冗余镜像说明**：
+- 此字段是 `EntityStateManager` 中怪物实体存亡状态的"冗余空间索引"
+- 用于寻路规避判断与地图视觉渲染
+- 无需每次去查实体表
+- 同步责任：当 `CombatEngine` 击败怪物后，必须由 `ActionProcessor` 调用本接口将对应坐标的 `hasMonster` 设为 `false`
+- `GridMapData` 自身不主动订阅战斗结果，只是被动接受写入
+
+### 1.3 updateBuilding(coordinate: Coordinate, buildingId: Long?): Boolean
+
+```kotlin
+// 仅更新某格子的 buildingId 字段（其他字段不变）
+// null 表示拆除/没有建筑
+// 格子不存在时返回 false，更新成功返回 true
+fun updateBuilding(coordinate: Coordinate, buildingId: Long?): Boolean
+```
+
+### 1.4 unlockTile(coordinate: Coordinate): List<Coordinate>
+
+```kotlin
+// 将一个格子从 VISIBLE_UNEXPLORED 升级为 EXPLORED
+// 并同时将其上下左右 4 个正方向邻居格子（若当前为 UNEXPLORED）原子性地更新为 VISIBLE_UNEXPLORED
+// 返回值：因本次解锁而新变为 VISIBLE_UNEXPLORED 的邻居坐标列表（最多 4 个）
+// 若目标格子不存在或当前状态不是 VISIBLE_UNEXPLORED，则返回空列表，不执行任何操作
+// 此方法是游戏"十字视野扩张"规则（说明书 §4.2.3）的唯一实现入口
+fun unlockTile(coordinate: Coordinate): List<Coordinate>
+```
+
+---
+
+## 2. 机械式步骤指令
+
+### 2.1 实现三个局部更新方法
+
+**唯一允许范式**：`ConcurrentHashMap.computeIfPresent`
+
+以 `updateExploreStatus` 为例：
+
+```kotlin
+fun updateExploreStatus(coordinate: Coordinate, status: ExploreStatus): Boolean {
+    val key = packToLong(coordinate.x, coordinate.y)
+    val result = tileMap.computeIfPresent(key) { _, oldTile ->
+        oldTile.copy(exploreStatus = status)
+    }
+    return result != null
+}
+```
+
+**updateMonsterPresence 实现**：
+```kotlin
+fun updateMonsterPresence(coordinate: Coordinate, hasMonster: Boolean): Boolean {
+    val key = packToLong(coordinate.x, coordinate.y)
+    val result = tileMap.computeIfPresent(key) { _, oldTile ->
+        oldTile.copy(hasMonster = hasMonster)
+    }
+    return result != null
+}
+```
+
+**updateBuilding 实现**：
+```kotlin
+fun updateBuilding(coordinate: Coordinate, buildingId: Long?): Boolean {
+    val key = packToLong(coordinate.x, coordinate.y)
+    val result = tileMap.computeIfPresent(key) { _, oldTile ->
+        oldTile.copy(buildingId = buildingId)
+    }
+    return result != null
+}
+```
+
+**设计约束**：
+- `ConcurrentHashMap.computeIfPresent` 对单个 Key 的操作在 Bucket 槽锁内以排他原子方式执行
+- 彻底消除多字段交叉覆盖的竞态
+
+### 2.2 实现 unlockTile（十字视野扩散）
+
+**步骤 A**：定义四个方向偏移量
+
+```kotlin
+private val directions = listOf(Pair(0, 1), Pair(0, -1), Pair(1, 0), Pair(-1, 0))
+```
+
+**步骤 B**：检查目标格子状态（关键！）
+
+⚠️ **重要警告**：`computeIfPresent` 的 lambda 如果返回 `null`，该 Key 会被从 Map 中删除！
+
+**错误做法**：
+```kotlin
+// 错误：状态不符时在 lambda 内返回 null，会导致格子被删除！
+tileMap.computeIfPresent(key) { _, old ->
+    if (old.exploreStatus == VISIBLE_UNEXPLORED) old.copy(...)
+    else null  // 危险！格子会被删除
+}
+```
+
+**正确做法**：
+```kotlin
+fun unlockTile(coordinate: Coordinate): List<Coordinate> {
+    val targetKey = packToLong(coordinate.x, coordinate.y)
+    
+    // 先检查状态，再决定是否调用 computeIfPresent
+    val currentTile = tileMap[targetKey] ?: return emptyList()
+    if (currentTile.exploreStatus != ExploreStatus.VISIBLE_UNEXPLORED) {
+        return emptyList()
+    }
+    
+    // 安全调用 computeIfPresent
+    tileMap.computeIfPresent(targetKey) { _, old ->
+        old.copy(exploreStatus = ExploreStatus.EXPLORED)
+    }
+    
+    // ... 处理邻居
+}
+```
+
+**步骤 C**：遍历四个方向，处理邻居格子
+
+```kotlin
+val newlyVisible = mutableListOf<Coordinate>()
+
+for ((dx, dy) in directions) {
+    val neighborCoord = Coordinate(coordinate.x + dx, coordinate.y + dy)
+    val neighborKey = packToLong(neighborCoord.x, neighborCoord.y)
+    
+    val neighborTile = tileMap[neighborKey] ?: continue  // 邻居不存在则跳过
+    
+    if (neighborTile.exploreStatus == ExploreStatus.UNEXPLORED) {
+        tileMap.computeIfPresent(neighborKey) { _, old ->
+            old.copy(exploreStatus = ExploreStatus.VISIBLE_UNEXPLORED)
+        }
+        newlyVisible.add(neighborCoord)
+    }
+}
+
+return newlyVisible
+```
+
+**设计约束**：
+- 以上所有操作无需额外的 `batchMutex`
+- `computeIfPresent` 的单键槽锁已保证各个格子更新的原子性
+- 5 个格子（1 个目标 + 最多 4 个邻居）的更新虽非全局事务，但游戏逻辑中是可接受的弱一致性
+- 邻居的更新顺序不影响最终视野结果
+
+---
+
+## 3. 禁止事项（硬性约束）
+
+1. **丢失更新漏洞红线**：绝对禁止使用"先读取，拷贝修改，再写回"的覆盖模式。
+
+   **禁止以下模式**：
+   ```kotlin
+   // 危险：Lost Update Bug
+   val old = getTile(x, y)
+   if (old != null) { 
+       setTile(old.copy(exploreStatus = status))
+   }
+   ```
+   
+   **原因**：高并发下，线程 A 读取旧格子准备改 `exploreStatus`，线程 B 同一时刻读取旧格子准备改 `hasMonster`，两线程各自 copy 后，线程 B 的写入会将线程 A 的修改悄无声息地覆盖——这是 `ConcurrentHashMap` 中最常见的数据撕裂陷阱。
+
+2. **禁止 computeIfPresent 返回 null 删除格子**：若格子状态不符条件，必须提前返回，不能在 lambda 内返回 null。
+
+3. **禁止自动创建格子**：所有更新方法在格子不存在时返回 false，不自动创建新格子。
+
+4. **禁止额外加锁**：单键更新无需 `batchMutex`。
+
+---
+
+## 4. 测试规范：GridMapDataAtomicUpdateTest.kt
+
+### 4.1 测试原则
+
+⚠️ 黑盒测试强制规则：禁止直接断言 `ConcurrentHashMap` 内部槽锁状态。所有验证必须通过公开 API 反映。
+
+### 4.2 测试用例
+
+**T01：并发多字段无覆盖测试**
+
+- 目的：验证多字段并发更新不会相互覆盖
+- 步骤：
+  1. 在 `Coordinate(0, 0)` 初始化格子
+  2. 初始值：`hasMonster = false`, `exploreStatus = UNEXPLORED`, `buildingId = null`
+  3. 启动 20 个并发协程：10 个调用 `updateExploreStatus(Coordinate(0,0), EXPLORED)`
+  4. 另 10 个调用 `updateMonsterPresence(Coordinate(0,0), true)`
+  5. 等待所有协程结束
+  6. 调用 `getTile(0, 0)`
+- 断言：结果同时满足 `exploreStatus == EXPLORED` 且 `hasMonster == true`
+- 通过标准：两字段并发更新无相互覆盖
+
+**T02：不存在格子更新边界测试**
+
+- 目的：验证不存在的格子不会被自动创建
+- 步骤：
+  1. 对未写入的坐标 `Coordinate(999, 999)` 调用 `updateBuilding(Coordinate(999, 999), 123L)`
+- 断言：
+  1. 返回 false
+  2. 该坐标依然返回 null（不会自动创建格子）
+- 通过标准：不存在的格子返回 false 且不创建
+
+**T03：十字视野扩散精确测试**
+
+- 目的：验证十字视野扩散逻辑正确
+- 步骤：
+  1. 写入 5 个格子：中心 `Coordinate(5, 5)` 状态为 `VISIBLE_UNEXPLORED`
+  2. 四方向邻居 `(5,6)` / `(5,4)` / `(6,5)` / `(4,5)` 状态均为 `UNEXPLORED`
+  3. 调用 `unlockTile(Coordinate(5, 5))`，记录返回的坐标列表
+- 断言 1：`getTile(5, 5)` 的 `exploreStatus` 变为 `EXPLORED`
+- 断言 2：返回列表包含恰好 4 个邻居坐标
+- 断言 3：四个邻居格子的 `exploreStatus` 均已变为 `VISIBLE_UNEXPLORED`
+- 通过标准：十字视野扩散精确生效
+
+**T04：十字视野不覆盖已探索格子测试**
+
+- 目的：验证已探索格子不会被降级
+- 步骤：
+  1. 在 T03 基础上，事先将 `(5, 6)` 设为 `EXPLORED` 状态
+  2. 调用 `unlockTile(Coordinate(5, 5))`
+- 断言：`(5, 6)` 的状态依然是 `EXPLORED`，不会被降级为 `VISIBLE_UNEXPLORED`
+- 通过标准：已探索格子不被降级
+
+**T05：状态不符时的无效解锁测试**
+
+- 目的：验证状态不符时操作不生效
+- 步骤：
+  1. 对一个 `exploreStatus = UNEXPLORED` 的格子调用 `unlockTile`
+- 断言：返回空列表，格子状态不变
+- 通过标准：状态不符时操作无效
+
+---
+
+## 5. 测试框架要求
+
+- 使用 kotlin.test 断言库
+- 并发测试使用 `kotlinx.coroutines` 协程和 `Dispatchers.Default`
+- 每个测试方法独立，无执行顺序依赖
+- 禁止使用反射访问私有字段
+
+---
+
+## 6. 输出要求
+
+1. 仅输出 Kotlin 代码文件（GridMapData.kt 增量 + GridMapDataAtomicUpdateTest.kt）
+2. 包含：四个接口实现、computeIfPresent 范式、十字视野扩散逻辑
+3. 不包含：批量更新锁、区域查询、序列化逻辑
+4. 代码格式：遵循 Kotlin 官方约定
+
+---
+
+## 7. 模块边界说明
+
+**MDU 2.1（已完成）**：状态模型、坐标压缩、基础读写
+**MDU 2.2（本章）**：局部属性原子更新、十字视野解锁
+**MDU 2.3（后续）**：区域查询与批量更新
+**MDU 2.4（后续）**：序列化与存档
+**MDU 2.5（后续）**：脏坐标流与完整性校验
+
+---
+
+## 8. 快速行为查阅
+
+**局部更新时序**：
+```
+updateExploreStatus(Coordinate(0,0), EXPLORED)
+  → key = packToLong(0, 0)
+  → tileMap.computeIfPresent(key) { old -> old.copy(exploreStatus = EXPLORED) }
+  → 返回 true（格子存在）或 false（格子不存在）
+```
+
+**十字解锁时序**：
+```
+unlockTile(Coordinate(5, 5))
+  → 检查 (5,5) 状态是否为 VISIBLE_UNEXPLORED
+  → 否：返回 emptyList()
+  → 是：computeIfPresent 更新为 EXPLORED
+  → 遍历四方向邻居：
+     - 邻居存在且状态为 UNEXPLORED
+     - computeIfPresent 更新为 VISIBLE_UNEXPLORED
+     - 添加到返回列表
+  → 返回新变为 VISIBLE_UNEXPLORED 的邻居列表
+```
+
+**并发安全保证**：
+```
+线程 A: updateExploreStatus((0,0), EXPLORED)
+线程 B: updateMonsterPresence((0,0), true)
+  → 两者进入 computeIfPresent 时由 ConcurrentHashMap 槽锁串行化
+  → 最终结果：exploreStatus=EXPLORED, hasMonster=true
+  → 无 Lost Update 覆盖
+```

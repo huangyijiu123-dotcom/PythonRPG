@@ -1,0 +1,113 @@
+# MDU 6.3: 全局上下文代理根对象封装与越权科技锁 (MDU-C: Global Context & Territory Root)
+
+作为 AI 编码助手，你的任务是为 Python 运行环境准备三个预先注入的全局入口根对象（`territory`、`map`、`guild`），并将跨 Tick 持久化存储与科技前置防爆锁融入其中。
+
+---
+
+## 1. 全局入口根对象契约 (Global Context Contract)
+
+在桥接器中定义以下三个根对象类。它们作为 Python 脚本访问领地万物的根：
+
+```kotlin
+// 1. 领地全局查询根代理
+class TerritoryProxy(
+    val time_of_day: String,             // "清晨" | "白天" | "黄昏" | "夜晚"
+    val current_tick: Int,               // 当前 Tick 编号
+    val ticks_until_night: Int,          // 距夜晚剩余 Tick 数
+    val player_gold: Int,                // 只读金币
+    val weather: String,                 // 天气
+    val active_policies: List<String>,   // 激活法令列表
+    val memory: MutableMap<String, Any>, // 跨 Tick 持久化字典（存档级生命周期绑定）
+    @Transient private val entityState: EntityStateManager,
+    @Transient private val commandBuffer: MutableList<PlayerCommand>
+) {
+    fun get_all_villagers(): List<VillagerProxy> = emptyList() // 内部读取快照转换
+    fun get_idle_villagers(): List<VillagerProxy> = emptyList() // status 为 RESTING/IDLE
+    fun get_injured_villagers(): List<VillagerProxy> = emptyList()
+    
+    fun get_all_caravans(): List<CaravanProxy> = emptyList()
+    fun get_idle_caravans(): List<CaravanProxy> = emptyList()
+    
+    fun get_all_city_states(): List<CityStateProxy> = emptyList()
+    fun get_all_buildings(): List<BuildingProxy> = emptyList()
+    fun get_buildings(type_name: String): List<BuildingProxy> = emptyList()
+    
+    val royal_warehouse: WarehouseProxy? get() = null
+    fun find_nearest_warehouse(x: Int, y: Int): WarehouseProxy? = null
+    
+    // 领地操作 API（转化为 Command 追加到 commandBuffer）
+    fun build(type_name: String, x: Int, y: Int): Boolean = false
+    fun is_tech_unlocked(tech_id: String): Boolean = false
+    fun start_research(tech_id: String): Boolean = false
+    fun enact_policy(policy_name: String, is_active: Boolean): Boolean = false
+}
+
+// 2. 世界地图查询根代理 (带高级探索科技锁)
+class MapProxy(
+    private val isAdvancedExplorationUnlocked: Boolean,
+    private val mapData: GridMapData
+) {
+    // 只有在解锁“高级探索 (ADVANCED_EXPLORATION)”科技后才返回有效数据，否则必须抛出 SecurityException 阻断！
+    fun get_tile(x: Int, y: Int): TileProxy? {
+        if (!isAdvancedExplorationUnlocked) {
+            throw SecurityException("👴 村长：大人，高空迷雾笼罩，我们尚未掌握【高级探索】科技，无法遥感该区域地形！")
+        }
+        val tile = mapData.getTile(x, y) ?: return null
+        return TileProxy(tile.x, tile.y, tile.terrain, tile.isLocked, tile.isExplored, false)
+    }
+}
+
+// 3. 冒险者公会查询根代理
+class GuildProxy(
+    @Transient private val entityState: EntityStateManager,
+    @Transient private val commandBuffer: MutableList<PlayerCommand>
+) {
+    fun get_all_adventurers(): List<AdventurerProxy> = emptyList()
+    fun get_idle_adventurers(): List<AdventurerProxy> = emptyList()
+    
+    // 公会操作 API（转化为 Command 追加到 commandBuffer）
+    fun dispatch(adv: AdventurerProxy, x: Int, y: Int) {}
+    fun recall(adv: AdventurerProxy) {}
+}
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **未授权科技越权防范红线 (Tech-Lock Redline)**：
+   在 `MapProxy.get_tile` 内部，**绝对不能**绕过前置科技检查！如果 `isAdvancedExplorationUnlocked == false`，必须抛出 `SecurityException` 彻底切断玩家脚本对地图任意坐标块的越权嗅探。
+2. **禁止直接返回全局 Map 字典的可写引用**：任何从代理查出的数据必须深拷贝或作为只读 Proxy 呈现，防止沙箱外逃。
+
+### 机械式步骤指令：
+1. 编写以上三个全局代理。在 `TerritoryProxy` 内部声明 `val memory = ConcurrentHashMap<String, Any>()`，此字典在多次脚本调用中**保持同一实例**，以允许玩家脚本通过 `territory.memory['count'] = 1` 机制进行 Tick 间的复杂状态记忆。
+2. 实现在 `GuildProxy` 内部的 `dispatch` 动作转发：
+   - 提取传入的 `adv.id`。
+   - 向 `commandBuffer` 追填 `PlayerCommand.DispatchAdventurer(adv.id, x, y)`。
+
+---
+
+## MDU 6.3-TEST: 全局入口查询与越权科技锁黑盒测试
+
+编写单元测试 `PythonGlobalContextTest.kt`。
+
+### 机械式测试用例：
+1. **领地全局属性与 Tick 内存持久化读写测试**：
+   - 初始化包含 `memory` 字典的 `TerritoryProxy`。
+   - 在 Python 沙箱运行脚本 1：`territory.memory['counter'] = 42`。
+   - 运行完毕后，不重置 `memory` 字典，再次运行脚本 2：`print(territory.memory['counter'])`。
+   - **断言 1**：第二次执行的 stdout 输出内容包含 `"42"`。
+   - **断言 2**：`territory.player_gold` 在金币变化时可以被准确快照读取。
+2. **未授权高级探索科技锁拦截测试**：
+   - 实例化 `MapProxy`，设定前置解锁标识 `isAdvancedExplorationUnlocked = false`（科技未解锁）。
+   - 在 Python 沙箱中调用：`map.get_tile(5, 5)`。
+   - **断言 1**：调用触发崩溃抛出 `SecurityException`，报错原因含 `"高级探索"`。
+   - **断言 2**：`ScriptResult.success` 变回 `false`，错误原因为 `RUNTIME_ERROR`。
+3. **科技解锁后地图数据正常读取测试**：
+   - 实例化 `MapProxy`，设定 `isAdvancedExplorationUnlocked = true`。
+   - 调用 `map.get_tile(2, 2)`。
+   - **断言**：成功获取 `TileProxy`，且属性正确无误。
+
+### 交付物：
+只包含 `TerritoryProxy`, `MapProxy`, `GuildProxy` 三个入口根对象定义、跨 Tick 内存存储机制、高级探索科技硬性阻断校验、及对应沙箱越权测试。不包含具体的动作指令（assign_job 等）内部方法完善。

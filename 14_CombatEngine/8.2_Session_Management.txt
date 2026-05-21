@@ -1,0 +1,81 @@
+# MDU 8.2: 答题时钟倒计时、MP 技能池与 Boss 禁用锁 (MDU-B: Countdown & MP Skills)
+
+作为 AI 游戏战斗系统设计专家，你的任务是为战斗引擎设计基于怪物敏捷度的“答题动态倒计时算法”，并编写支持 MP 技能逻辑、耗蓝拦截及 Boss 免疫高级奥义锁的控制器。
+
+---
+
+## 1. 倒计时与技能计算契约 (Interface Contract)
+
+在 `CombatEngine` 中声明并实现以下时钟预测与奥义技能管理接口（确保数据的严格有效性）：
+
+```kotlin
+// 技能枚举池
+enum class MpSkill {
+    EXTEND_TIME,   // 延长时间（+5 秒倒计时），消耗 5 MP
+    ELIMINATE,     // 排除两个错误选项，消耗 8 MP
+    AUTO_CORRECT   // 自动答对当前题（Boss 战禁用），消耗 15 MP
+}
+
+// 实时获取当前题目的答题倒计时时长限制（秒，可供 UI 渲染和脚本计时器）
+fun getCountdownSeconds(sessionId: Long): Float
+
+// 使用 MP 技能奥义
+// currentMp: 外部传入的参战冒险者实时 MP 余额
+// 返回：Pair(是否释放成功, 实际消耗 MP 数)
+fun useMpSkill(sessionId: Long, skill: MpSkill, currentMp: Int): Pair<Boolean, Int>
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **Boss 战高级奥义强免疫红线 (Boss Immunity Redline)**：
+   **绝对禁止**玩家在 Boss 关卡（`monsterSnapshot.isBoss == true`）中使用 `AUTO_CORRECT`（自动答对）进行无脑通关！一旦发现此违规行为，必须返回 `Pair(false, 0)` 且不能扣除任何 MP，保障 Boss 玩法的策略尊严。
+2. **禁止蓝量负值穿透**：MP 不足直接拦截，防止蓝量被扣成负数。
+
+### 机械式步骤指令：
+1. **实现动态倒计时算法 (`getCountdownSeconds`)**：
+   - 步骤 A：从活跃会话中提取当前战斗。若不存在，返回 `0.0f`。
+   - 步骤 B：读取怪物的敏捷属性 $Agility_{monster}$。
+   - 步骤 C：执行敏捷倒计时衰减公式（保底敏捷限制在 $\ge 0$）：
+     $$\text{倒计时秒数} = 6.0f + \frac{10.0f}{1.0f + Agility_{monster}}$$
+   - 步骤 D：返回运算后的浮点型秒数。
+2. **实现 MP 奥义消费控制器 (`useMpSkill`)**：
+   - 步骤 A：定位战斗会话。若不存在，直接返回 `Pair(false, 0)`。
+   - 步骤 B：**技能耗蓝字典映射**：
+     - `EXTEND_TIME` $\rightarrow$ 消耗 5 MP。
+     - `ELIMINATE` $\rightarrow$ 消耗 8 MP。
+     - `AUTO_CORRECT` $\rightarrow$ 消耗 15 MP。
+   - 步骤 C：**Boss 免疫奥义拦截**：
+     - 若 `skill == MpSkill.AUTO_CORRECT` 且会话的 `monsterSnapshot.isBoss == true`：
+       - 返回 `Pair(false, 0)` 拒绝施法。
+   - 步骤 D：**蓝量余额校验**：
+     - 若传入的 `currentMp` 小于对应技能消耗，直接返回 `Pair(false, 0)`（蓝量不足拦截）。
+   - 步骤 E：**施法成功回扣**：
+     - 调用外部 provider 扣减：`provider.deductAdventurerMp(session.adventurerId, requiredMp)`。若扣减成功，返回 `Pair(true, requiredMp)`。
+
+---
+
+## MDU 8.2-TEST: 敏捷倒计时与 Boss 战 MP 奥义拦截测试
+
+编写单元测试 `CombatMpSkillAndCountdownTest.kt`。
+
+### 机械式测试用例：
+1. **怪物敏捷倒计时衰减计算测试**：
+   - 注册怪兽 1（敏捷 = 0）。调用 `getCountdownSeconds`，断言返回 `16.0f` 秒（敏捷为 0 倒计时最长）。
+   - 注册怪兽 2（敏捷 = 5）。调用 `getCountdownSeconds`，断言返回 `6.0 + 10/6 = 7.67f` 秒左右（误差控制在 $\le 0.01f$ 内，敏捷越高，答题越局促）。
+2. **Boss 战强硬禁用 AUTO_CORRECT 拦截测试**：
+   - 启动一场 Boss 战（`isBoss = true`），玩家当前 MP 充裕，余额为 100。
+   - 玩家尝试调用 `useMpSkill(sessionId, MpSkill.AUTO_CORRECT, currentMp = 100)`。
+   - **断言 1**：返回回执为 `Pair(false, 0)`，奥义释放失败。
+   - **断言 2**： provider 未收到任何扣减调用，MP 消耗为 0。
+3. **金金不足与施法消耗熔断测试**：
+   - 启动普通小怪战斗（`isBoss = false`），玩家当前 MP 仅存 10。
+   - 尝试释放 `MpSkill.AUTO_CORRECT`（需要 15 MP）。
+   - **断言**：因蓝量不足，被直接拦截，返回 `Pair(false, 0)`。
+   - 在同样环境下释放 `MpSkill.EXTEND_TIME`（需要 5 MP）。
+   - **断言**：蓝量充足通过，返回 `Pair(true, 5)`。
+
+### 交付物：
+只包含 `getCountdownSeconds` 动态公式、`useMpSkill` 耗蓝及 Boss 拦截分配实现、以及对应倒计时和奥义阻断测试。不包含任何手动答题和自动结算流程。

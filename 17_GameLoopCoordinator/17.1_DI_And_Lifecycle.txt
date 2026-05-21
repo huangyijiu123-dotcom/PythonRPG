@@ -1,0 +1,231 @@
+# MDU 17.1: 全局心跳协调者生命周期与依赖注入骨架
+
+## 任务目标
+
+为游戏大循环构建唯一的核心订阅者骨架 `GameLoopCoordinator`，定义其构造注入契约、并发安全的协程控制句柄，并实现双重启动拦截机制。
+
+**输出标准**：activeJob 必须使用 AtomicReference；startLoop 必须幂等防重入；stopLoop 必须完全注销 Job 防止内存泄漏。
+
+---
+
+## 1. 调度器 DI 与生命周期控制契约（不可更改构造函数参数名与类型）
+
+### 1.1 GameLoopCoordinator 类声明
+
+```kotlin
+// 全局心跳大循环协调器（唯一订阅 TickEngine.tickFlow 的 Collector）
+class GameLoopCoordinator(
+    private val tickEngine: TickEngine,
+    private val weatherEngine: WeatherEngine,
+    private val policyEngine: PolicyEngine,
+    private val buildingEngine: BuildingEngine,
+    private val workshopEngine: WorkshopEngine,
+    private val forgeEngine: ForgeEngine,
+    private val eventEngine: EventEngine,
+    private val marketEngine: MarketEngine,
+    private val actionProcessor: ActionProcessor,
+    private val entityState: EntityStateManager,
+    private val mapData: GridMapData,
+    private val coroutineScope: CoroutineScope  // 自定义调度作用域
+) {
+    // 启动全局大循环协程，长期订阅 tickFlow
+    fun startLoop()
+    
+    // 停止循环协程，注销订阅并平滑退场
+    fun stopLoop()
+}
+```
+
+---
+
+## 2. 机械式步骤指令
+
+### 2.1 构建安全的 AtomicReference 并发句柄
+
+在 GameLoopCoordinator 内部声明原子引用容器来托管当前活跃的协程 Job：
+
+```kotlin
+private val activeJob = AtomicReference<Job?>()
+```
+
+### 2.2 实现幂等防重入启动（startLoop）
+
+**步骤 A：双重启动防御审查**
+
+若 activeJob.get() != null，代表当前游戏主循环已在稳定运转中，静默拦截退出（防重入）。
+
+**步骤 B：申请独立子协程 Job**
+
+开启一个全新协程任务，并在其闭包中订阅 tickEngine.tickFlow：
+
+```kotlin
+fun startLoop() {
+    // 步骤 A：双重启动防御
+    if (activeJob.get() != null) {
+        return  // 静默拦截，防止重入
+    }
+    
+    // 步骤 B：申请独立子协程 Job
+    val newJob = coroutineScope.launch {
+        tickEngine.tickFlow.collect { tickEvent ->
+            // 调度流程由 MDU 17.2 负责实现
+        }
+    }
+    
+    // 原子赋值：若 CAS 竞争失败（代表被其他线程抢先开启），则立即取消该 newJob
+    if (!activeJob.compareAndSet(null, newJob)) {
+        newJob.cancel()  // 抢先失败，取消多余 Job
+    }
+}
+```
+
+### 2.3 实现平滑生命周期退场销毁（stopLoop）
+
+原子提取当前任务，物理呼叫取消：
+
+```kotlin
+fun stopLoop() {
+    // 原子提取并重置为 null
+    val job = activeJob.getAndSet(null)
+    
+    if (job != null) {
+        // 物理呼叫取消，将订阅流安全掐断
+        job.cancel()
+    }
+}
+```
+
+---
+
+## 3. 禁止事项（硬性约束）
+
+1. **多头订阅与重入溢出红线**：在系统设计中，**有且仅能允许 `GameLoopCoordinator` 唯一持续订阅 `tickFlow`**！其余所有业务模块（如 Weather, Building 等）严禁自行收集心跳。同时，在调用 `startLoop` 时必须强力校对当前是否已有活跃任务句柄，绝对禁止双重启动导致并发抢占 Tick ID 出现脑裂。
+
+2. **禁止空挂状态**：`stopLoop` 时必须将 Job 完全注销清理，并重置引用为空，保障内存无泄漏。
+
+3. **禁止使用非原子方式操作 Job 引用**：必须使用 `AtomicReference` 的 `get`、`compareAndSet`、`getAndSet` 方法，禁止直接赋值或读取。
+
+---
+
+## 4. 测试规范：CoordinatorLifecycleTest.kt
+
+### 4.1 测试原则
+
+⚠️ 并发测试强制规则：必须使用 Mock 引擎注入，验证 Job 原子操作无竞争。
+
+### 4.2 测试用例
+
+**T01：幂等安全防重入启动测试**
+
+- 目的：验证连续调用 startLoop 只启动一个协程
+- 步骤：
+  1. Mock 10 大下层引擎及 TickEngine
+  2. 实例化 GameLoopCoordinator
+  3. 连续调用三次 startLoop()
+- 断言 1：第一次调用成功生成协程任务 Job，并存入原子引用中
+- 断言 2：后续两次调用均静默拦截，原子引用的 Job 对象与第一次生成的 Job 为同一个物理对象，无任何新协程任务重叠脑裂启动
+- 通过标准：幂等防重入生效
+
+**T02：平滑退场安全注销测试**
+
+- 目的：验证 stopLoop 完全注销 Job 且无内存泄漏
+- 步骤：
+  1. 启动大循环 startLoop()
+  2. 此时 activeJob 处于活跃工作态
+  3. 呼叫注销平滑退场：stopLoop()
+- 断言 1：activeJob 的内部引用瞬间重置变为了 null
+- 断言 2：被注销的 Job 的 isCancelled 属性精准等于 true，证明心跳订阅已经被无泄漏完全关闭
+- 通过标准：平滑退场注销正确
+
+**T03：stop 后 restart 正常启动测试**
+
+- 目的：验证 stopLoop 后 can 重新 startLoop
+- 步骤：
+  1. 调用 startLoop()
+  2. 调用 stopLoop()
+  3. 断言：activeJob.get() == null
+  4. 再次调用 startLoop()
+  5. 断言：activeJob.get() != null（新 Job 成功启动）
+- 通过标准：stop 后可重新启动
+
+**T04：并发竞争 CAS 防脑裂测试**
+
+- 目的：验证多线程同时调用 startLoop 时只有一个 Job 存活
+- 步骤：
+  1. 使用 10 个并发线程同时调用 startLoop()
+  2. 等待所有线程执行完毕
+- 断言：activeJob.get() 不为 null，且 tickEngine.tickFlow 的订阅者只有一个（GameLoopCoordinator）
+- 通过标准：CAS 防脑裂生效
+
+---
+
+## 5. 测试框架要求
+
+- 使用 kotlin.test 断言库
+- 并发测试使用 kotlinx.coroutines 的 runBlocking / launch
+- 每个测试方法独立，无执行顺序依赖
+- 禁止使用反射访问私有字段（activeJob 可通过 startLoop/stopLoop 间接验证）
+
+---
+
+## 6. 输出要求
+
+1. 仅输出 Kotlin 代码文件（GameLoopCoordinator.kt + CoordinatorLifecycleTest.kt）
+2. 包含：GameLoopCoordinator 类声明、activeJob AtomicReference、startLoop（幂等防重入）、stopLoop（平滑注销）
+3. 不包含：processTick 串行管线具体时序细节（由 MDU 17.2 实现）
+4. 代码格式：遵循 Kotlin 官方约定
+
+---
+
+## 7. 模块边界说明
+
+**MDU 17.1（本章）**：生命周期、DI、Job 原子操作
+**MDU 17.2（后续）**：processTick 串行管线、各引擎调度时序
+**MDU 17.3（后续）**：错误处理、异常恢复
+**MDU 17.4（后续）**：性能优化、语义冻结
+
+---
+
+## 8. 快速行为查阅
+
+**startLoop 幂等防重入**：
+```
+startLoop() 第一次调用
+  → activeJob.get() == null → 继续
+  → newJob = coroutineScope.launch { tickEngine.tickFlow.collect { ... } }
+  → activeJob.compareAndSet(null, newJob) → true（成功）
+  → activeJob.get() == newJob
+
+startLoop() 第二次调用
+  → activeJob.get() != null → 静默 return（防重入）
+
+startLoop() 第三次调用
+  → activeJob.get() != null → 静默 return（防重入）
+```
+
+**stopLoop 平滑注销**：
+```
+stopLoop()
+  → job = activeJob.getAndSet(null)  // 原子提取并清零
+  → job != null → job.cancel()
+  → activeJob.get() == null
+  → job.isCancelled == true
+```
+
+**并发竞争 CAS 防脑裂**：
+```
+Thread A: startLoop()
+  → activeJob.get() == null
+  → newJobA = launch { ... }
+  → activeJob.compareAndSet(null, newJobA) → true（A 成功）
+
+Thread B: startLoop()
+  → activeJob.get() != null（A 已抢先）
+  → 静默 return（B 被拦截）
+
+Thread C: startLoop()
+  → activeJob.get() != null
+  → 静默 return（C 被拦截）
+
+最终结果：只有一个 Job（newJobA）存活
+```

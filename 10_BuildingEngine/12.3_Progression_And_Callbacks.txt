@@ -1,0 +1,72 @@
+# MDU 12.3: 时序心跳推进、仓库扩容回调与战毁残骸机制 (MDU-C: Tick Progression & Destroys)
+
+作为 AI 建造与经营专家，你的任务是为建筑管理器接入外部心跳推进 API，实现建造/升级时序逻辑滚动，并挂载王城/仓库升级完成时的“反向扩容通知回调”及特定火灾或外敌打击下的“战损残骸机制”。
+
+---
+
+## 1. 进度推进与战损回调契约 (Tick & Damage Contract)
+
+在建筑引擎中声明并实现心跳时序自增推进与战损标记 API（确保状态演进在并发下的安全性）：
+
+```kotlin
+// 外部中央大循环在每 Tick 推进时主动调用，滚动所有处于 UNDER_CONSTRUCTION/UPGRADING 的建筑进度
+fun processTick()
+
+// 标记建筑物彻底被摧毁（如被森林火灾吞噬或受外敌攻击）
+// 建筑转为 DESTROYED 状态（保留废墟记录以供重构或历史分析）
+fun destroyBuilding(buildingId: Long)
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **静默扩容遗漏红线 (Callback Omission Redline)**：
+   一旦仓库类建筑（`LOCAL_STORAGE`、`DISTRIBUTION`）或者大本营王城（`ROYAL_CASTLE`）**升级完工变回 ACTIVE 状态的一瞬间，必须强制调用** `dependencyProvider.notifyWarehouseCapacityExpanded(buildingId, additionalCapacity)`！扩容公式硬性规定为：`additionalCapacity = 500 * newLevel`（即新升等级越大，给状态库贡献的额外背包储量越多）。严禁出现完工却不给背包库扩容的财务漏洞。
+2. **禁止直接物理擦除**：`destroyBuilding` 调用后，仅仅将其状态修改为 `DESTROYED`（战损残骸），绝对不准直接从 ConcurrentHashMap 中擦除其坐标残影，确保玩家可清除废墟或在原址重建。
+
+### 机械式步骤指令：
+1. **心跳时序演进算法实现 (`processTick`)**：
+   - 遍历 `buildings.values` 的快照副本：
+     - 若 `snap.state == ACTIVE` 或 `snap.state == DESTROYED`，直接安全跳过。
+     - 若 `snap.state == UNDER_CONSTRUCTION` 或 `snap.state == UPGRADING`：
+       - 递增建造进度：`snap.constructionProgress += 1`。
+       - **完工判定与状态跳变**：
+         - 若 `snap.constructionProgress >= snap.maxConstructionProgress`：
+           - **新房破土完工**（原为 `UNDER_CONSTRUCTION`）：
+             - 修改状态为 `BuildingState.ACTIVE`，等级 `level = 1`，进度 `constructionProgress = 0`。
+           - **旧房升级完工**（原为 `UPGRADING`）：
+             - 修改状态为 `BuildingState.ACTIVE`，等级 `level += 1`，进度 `constructionProgress = 0`。
+             - **反向同步仓库扩容回调**：
+               - 若建筑 `type` 属于 `LOCAL_STORAGE`、`DISTRIBUTION` 或 `ROYAL_CASTLE`：
+                 - 计算追加容量：`val additionalCapacity = 500 * snap.level`
+                 - 执行接口通知：`dependencyProvider.notifyWarehouseCapacityExpanded(snap.buildingId, additionalCapacity)`。
+2. **战损残骸标记实现 (`destroyBuilding`)**：
+   - 寻找对象：`val snap = buildings[buildingId] ?: return`。
+   - 状态擦涂：修改 `snap.state = BuildingState.DESTROYED`。
+
+---
+
+## MDU 12.3-TEST: 时序完工跳变、完工容量扩容回调与战毁残骸测试
+
+编写单元测试 `BuildingLifecycleAndDestructionTest.kt`。
+
+### 机械式测试用例：
+1. **新建完工状态流转与激活测试**：
+   - 注入一个处于 `UNDER_CONSTRUCTION` 状态且建造时长为 3 Ticks 的民房，等级为 0。
+   - 连续调用 3 次 `processTick()`。
+   - **断言**：获取该建筑，其状态流转为了 `ACTIVE`，等级从 0 级顺利提升至 `1`，进度重置为 0。
+2. **仓库升级完工同步反向扩容测试**：
+   - Mock 依赖项：捕获 `notifyWarehouseCapacityExpanded` 接收到的所有容量记录。
+   - 注入一个处于 `UPGRADING` 状态的 `LOCAL_STORAGE` 仓库，当前等级为 1，升级需要 5 Ticks。
+   - 连续调用 5 次 `processTick()`。
+   - **断言 1**：完工后，仓库等级自增为 `2`，状态变回 `ACTIVE`。
+   - **断言 2**：回调函数精准被触发，且反向通知底座的扩容容积为 $500 \times 2 = 1000$，数据无缝同步。
+3. **战损废墟残存状态测试**：
+   - 将民房设为 `ACTIVE` 状态。
+   - 传入民房 ID，调用 `destroyBuilding` 摧毁它。
+   - **断言**：通过 `getBuildingAt` 查询该坐标，建筑依旧存在于地图中（废墟残影），但其状态已被强制涂改成了 `DESTROYED`。
+
+### 交付物：
+只包含 `processTick` 心跳滚动、扩容回调判断、`destroyBuilding` 残骸修改方法、以及完工升级与毁灭状态机的 JUnit 单元测试代码。不含放置合法性拦截及物流分拨中心几何辐射搜罗计算。

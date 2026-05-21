@@ -1,0 +1,176 @@
+MDU 1.5: 集成并发抗压测试
+任务目标
+对完整合流后的 TickEngine 进行极限并发高压
+黑盒测试，封锁全部潜在时序漏洞，验证系统在极端条件下的健壮性。
+
+输出标准：代码必须通过 Kotlin 编译，所有测试在虚拟时间和真实多线程环境下均稳定通过。
+
+1. 压力测试用例
+T01：高频交叉暂停不崩溃测试
+目的：验证 50 协程并发随机调用暂停/恢复 API 时，无并发异常，状态无残留。
+步骤：
+
+启动引擎：start()
+创建 50 个协程，随机执行以下操作组合（共 1000 次调用）：
+
+pauseEngine()
+resumeEngine()
+pauseLogic()
+resumeLogic()
+setGameSpeed(randomInterval())
+
+
+所有协程 joinAll() 等待完成
+调用 stop()
+查询最终状态
+
+断言：
+
+A1：无 ConcurrentModificationException 或任何并发异常
+A2：isEnginePaused() == false
+A3：isLogicPaused() == false
+
+通过标准：无异常，状态归零。
+T02：订阅者异常不崩溃测试
+目的：验证 Flow 消费者抛出异常时，主引擎不受影响，继续平稳运行。
+步骤：
+
+启动引擎：start()
+创建第一个订阅者（会抛异常）：
+```kotlin
+val badJob = scope.launch {
+    try {
+        tickFlow.collect { throw RuntimeException("模拟消费者异常") }
+    } catch (e: Exception) {
+        // 显式捕获异常以防测试框架崩溃，并在外部记录以供断言
+        exceptionCaught = e
+    }
+}
+```
+
+创建第二个订阅者（正常）：kotlin复制val goodResults = mutableListOf<TickEvent>()
+val goodJob = scope.launch { tickFlow.toList(goodResults) }
+
+advanceTimeBy(5_000)
+取消两个订阅者
+
+断言：
+
+A1：第一个订阅者抛出异常后，主引擎未崩溃
+A2：第二个订阅者在 5000ms 内持续收到 TickEvent，数量 > 0
+A3：isEnginePaused() 和 isLogicPaused() 均为 false
+
+通过标准：异常隔离，引擎健壮运行。
+T03：50 并发重入防累积发射测试
+目的：验证 50 协程并发调用 start() 时，Tick 发射数不超过物理上限。
+步骤：
+
+订阅 tickFlow：val events = mutableListOf<TickEvent>(); scope.launch { tickFlow.toList(events) }
+使用 Dispatchers.Default 并发启动 50 个协程：kotlin复制val jobs = (1..50).map { index ->
+    scope.launch(Dispatchers.Default) {
+        engine.start(initialTick = 0)
+    }
+}
+jobs.joinAll()
+
+advanceTimeBy(500)
+取消订阅
+
+断言：
+
+A1：由于 startMutex.withLock 排他锁，同一时刻只有一个 start() 执行
+A2：events.size 在 500ms 内应 ≤ 1（默认 5000ms 间隔，不可能发射多个）
+A3：若发现 events.size > 1，说明存在协程叠加泄漏（应触发测试失败）
+
+通过标准：Tick 发射数符合单循环物理上限。
+T04：变速高频切换不丢事件测试
+目的：验证在高速和低速切换时，已发射的 TickEvent 不丢失。
+步骤：
+
+setGameSpeed(500L) → start() → 订阅 tickFlow
+advanceTimeBy(600) → 至少 1 个 Tick
+setGameSpeed(5_000L) → 减速
+advanceTimeBy(500) → 继续收集
+setGameSpeed(500L) → 再加速
+advanceTimeBy(1_200) → 收集
+取消订阅
+
+断言：
+
+A1：每个阶段切换后，心跳发射继续正常
+A2：events 总数符合各阶段时间比例
+
+通过标准：变速平滑，无事件丢失。
+2. 测试框架要求
+
+使用 kotlinx.coroutines.test.TestScope 虚拟时间测试
+使用 Dispatchers.setMain + Dispatchers.Default 混合调度器
+使用 kotlin.test 断言库
+并发测试使用 AtomicInteger 记录异常数量
+每个测试独立，无执行顺序依赖
+
+3. 语义级冻结声明
+
+🔒 当本 MDU 的全部压力测试集通过后，TickEngine 核心语义即告冻结入库。
+
+冻结语义边界（外部模块必须遵守）
+
+
+
+编号
+冻结语义
+说明
+
+
+
+
+F1
+双轨心跳隔离
+realTickFlow 固定 50ms，tickFlow 变速
+
+
+F2
+双轨控制隔离
+pauseEngine() 全停，pauseLogic() 仅逻辑停
+
+
+F3
+24 步时段换算
+MORNING/DAYTIME/TWILIGHT/NIGHT 四时段映射
+
+
+F4
+单向消费原则
+外部模块只能作为 Flow 消费者，禁止修改内部 Job
+
+
+
+允许进化范围（数据结构 Patch）
+
+
+
+场景
+允许操作
+
+
+
+
+扩展 TickEvent 字段
+可增加 deltaTime、accumulatorRate 等环境承载字段
+
+
+调整默认间隔
+可修改 intervalMs 默认值（5000L）
+
+
+增加监控指标
+可暴露只读指标 currentIntervalMs 等
+
+
+
+4. 输出要求
+
+仅输出 Kotlin 代码文件（TickEngineConcurrencyTest.kt）
+包含：4 个压力测试用例、异常容错验证
+不包含：主引擎代码修改（仅测试）
+代码格式：遵循 Kotlin 官方约定

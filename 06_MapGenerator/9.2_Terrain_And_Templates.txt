@@ -1,0 +1,287 @@
+# MDU 9.2: 大本营固定模板与动态地形权重生成
+
+## 任务目标
+
+构建领地核心大本营的"5×5 确定性开局拓扑模板"，并编写基于伪随机哈希段分布的"动态加权地貌生成算法"。
+
+**输出标准**：大本营模板必须硬编码禁止随机扰动；地形生成必须使用 `hash % 100` 权重摇号；各圈层权重分配精确。
+
+---
+
+## 1. 核心地形与模板契约（不可更改字段名与类型）
+
+### 1.1 TemplateTile 数据类
+
+```kotlin
+// 大本营固定开局坐标地块定义
+data class TemplateTile(
+    val terrainTypeId: String,
+    val initialExploreStatus: String,
+    val monsterTypeId: String?,
+    val monsterLevel: Int?
+)
+```
+
+### 1.2 getCampTemplate(coordinate: Coordinate): TemplateTile?
+
+```kotlin
+// 判定并生成非随机开局模板
+fun getCampTemplate(coordinate: Coordinate): TemplateTile?
+```
+
+### 1.3 generateTerrainType(seed: Long, x: Int, y: Int, zone: MapZone): String
+
+```kotlin
+// 根据圈层权重伪随机分配地形
+fun generateTerrainType(seed: Long, x: Int, y: Int, zone: MapZone): String
+```
+
+---
+
+## 2. 大本营 5×5 固定模板
+
+### 2.1 硬编码坐标映射字典
+
+**11 个黄金坐标地块**（必须完全硬编码，禁止随机扰动）：
+
+| 坐标 | terrainTypeId | initialExploreStatus | monsterTypeId | monsterLevel |
+|------|---------------|---------------------|---------------|--------------|
+| (0,0) | BASE_CAMP | EXPLORED | null | null |
+| (0,1) | PLAINS | EXPLORED | null | null |
+| (1,0) | PLAINS | VISIBLE_UNEXPLORED | SLIME | 1 |
+| (-1,0) | FOREST | VISIBLE_UNEXPLORED | SLIME | 1 |
+| (0,-1) | PLAINS | VISIBLE_UNEXPLORED | SLIME | 1 |
+| (-1,2) | FOREST | UNEXPLORED | SLIME | 1 |
+| (1,2) | PLAINS | UNEXPLORED | null | null |
+| (-2,0) | MOUNTAIN | UNEXPLORED | GOBLIN | 1 |
+| (2,0) | MOUNTAIN | UNEXPLORED | GOBLIN | 1 |
+| (1,-1) | FOREST | UNEXPLORED | GOBLIN | 1 |
+| (-1,-1) | FOREST | UNEXPLORED | GOBLIN | 1 |
+
+### 2.2 实现 getCampTemplate
+
+```kotlin
+fun getCampTemplate(coordinate: Coordinate): TemplateTile? {
+    return when (coordinate) {
+        Coordinate(0, 0) -> TemplateTile("BASE_CAMP", "EXPLORED", null, null)
+        Coordinate(0, 1) -> TemplateTile("PLAINS", "EXPLORED", null, null)
+        Coordinate(1, 0) -> TemplateTile("PLAINS", "VISIBLE_UNEXPLORED", "SLIME", 1)
+        Coordinate(-1, 0) -> TemplateTile("FOREST", "VISIBLE_UNEXPLORED", "SLIME", 1)
+        Coordinate(0, -1) -> TemplateTile("PLAINS", "VISIBLE_UNEXPLORED", "SLIME", 1)
+        Coordinate(-1, 2) -> TemplateTile("FOREST", "UNEXPLORED", "SLIME", 1)
+        Coordinate(1, 2) -> TemplateTile("PLAINS", "UNEXPLORED", null, null)
+        Coordinate(-2, 0) -> TemplateTile("MOUNTAIN", "UNEXPLORED", "GOBLIN", 1)
+        Coordinate(2, 0) -> TemplateTile("MOUNTAIN", "UNEXPLORED", "GOBLIN", 1)
+        Coordinate(1, -1) -> TemplateTile("FOREST", "UNEXPLORED", "GOBLIN", 1)
+        Coordinate(-1, -1) -> TemplateTile("FOREST", "UNEXPLORED", "GOBLIN", 1)
+        else -> null
+    }
+}
+```
+
+---
+
+## 3. 多圈层加权地形随机划分
+
+### 3.1 权重分配算法
+
+**步骤 A**：利用 `hash(seed, x, y) % 100` 获得 [0, 99] 区间权重摇号数 W
+
+**步骤 B**：按圈层进行梯级划分
+
+**STARTER_ZONE（新手区）**：
+
+| W 范围 | terrainTypeId | 占比 |
+|--------|---------------|------|
+| 0 ≤ W < 50 | PLAINS | 50% |
+| 50 ≤ W < 90 | FOREST | 40% |
+| 其他 | MOUNTAIN | 10% |
+
+**MID_ZONE（中级区）**：
+
+| W 范围 | terrainTypeId | 占比 |
+|--------|---------------|------|
+| 0 ≤ W < 30 | PLAINS | 30% |
+| 30 ≤ W < 60 | FOREST | 30% |
+| 60 ≤ W < 80 | MOUNTAIN | 20% |
+| 80 ≤ W < 90 | SWAMP | 10% |
+| 其他 | RUINS | 10% |
+
+**HIGH_ZONE（高级区）**：
+
+| W 范围 | terrainTypeId | 占比 |
+|--------|---------------|------|
+| 0 ≤ W < 20 | FOREST | 20% |
+| 20 ≤ W < 45 | MOUNTAIN | 25% |
+| 45 ≤ W < 60 | SWAMP | 15% |
+| 60 ≤ W < 70 | RUINS | 10% |
+| 70 ≤ W < 85 | VOLCANO | 15% |
+| 其他 | TUNDRA | 15% |
+
+**ABYSS_ZONE（深渊区）**：
+
+| W 范围 | terrainTypeId | 占比 |
+|--------|---------------|------|
+| 0 ≤ W < 20 | MOUNTAIN | 20% |
+| 20 ≤ W < 30 | SWAMP | 10% |
+| 30 ≤ W < 45 | RUINS | 15% |
+| 45 ≤ W < 70 | VOLCANO | 25% |
+| 其他 | TUNDRA | 30% |
+
+### 3.2 实现 generateTerrainType
+
+```kotlin
+fun generateTerrainType(seed: Long, x: Int, y: Int, zone: MapZone): String {
+    val w = (hash(seed, x, y) % 100).toInt()
+    
+    return when (zone) {
+        MapZone.BASE_CAMP -> "BASE_CAMP"
+        MapZone.STARTER_ZONE -> when {
+            w < 50 -> "PLAINS"
+            w < 90 -> "FOREST"
+            else -> "MOUNTAIN"
+        }
+        MapZone.MID_ZONE -> when {
+            w < 30 -> "PLAINS"
+            w < 60 -> "FOREST"
+            w < 80 -> "MOUNTAIN"
+            w < 90 -> "SWAMP"
+            else -> "RUINS"
+        }
+        MapZone.HIGH_ZONE -> when {
+            w < 20 -> "FOREST"
+            w < 45 -> "MOUNTAIN"
+            w < 60 -> "SWAMP"
+            w < 70 -> "RUINS"
+            w < 85 -> "VOLCANO"
+            else -> "TUNDRA"
+        }
+        MapZone.ABYSS_ZONE -> when {
+            w < 20 -> "MOUNTAIN"
+            w < 30 -> "SWAMP"
+            w < 45 -> "RUINS"
+            w < 70 -> "VOLCANO"
+            else -> "TUNDRA"
+        }
+    }
+}
+```
+
+---
+
+## 4. 禁止事项（硬性约束）
+
+1. **开局黄金区污染红线**：对于开局 5×5 范围内的 11 个黄金坐标地块，必须完全强行采用硬编码覆盖，绝对不允许引入任何随机扰动，确保每局游戏开局教学路径高度一致。
+
+2. **禁止地形 ID 与实体字典脱轨**：生成的地形字符串必须与 `GridMapData` 约定严格保持一致（如 "PLAINS"、"FOREST"、"MOUNTAIN" 等）。
+
+3. **禁止 BASE_CAMP 进入加权分配**：`BASE_CAMP` 是大本营中心点，必须直接返回，不得参与权重摇号。
+
+---
+
+## 5. 测试规范：MapGenTerrainTemplateTest.kt
+
+### 5.1 测试原则
+
+⚠️ 确定性测试强制规则：模板查询必须幂等，大样本统计必须覆盖全部允许类型。
+
+### 5.2 测试用例
+
+**T01：大本营黄金坐标一致性测试**
+
+- 目的：验证 11 个硬编码坐标完全符合规格
+- 步骤：
+  1. 调用 `getCampTemplate(Coordinate(0, 0))`
+  2. 断言：返回 `TemplateTile("BASE_CAMP", "EXPLORED", null, null)`
+  3. 调用 `getCampTemplate(Coordinate(-2, 0))`
+  4. 断言：怪物必须是 `GOBLIN`，等级为 `1`
+  5. 调用 `getCampTemplate(Coordinate(5, 5))`
+  6. 断言：返回 `null`（已飞出开局模板黄金区）
+- 通过标准：所有黄金坐标精确匹配
+
+**T02：新手区地形类型白名单验证**
+
+- 目的：验证新手区只能生成允许的三类地形
+- 步骤：
+  1. 给定种子 `seed = 88888L`
+  2. 循环生成 1000 个新手区坐标 `(x = 1..1000, y = 1)` 的地形
+  3. 收集所有生成的地形类型
+- 断言：所有地形类型只能是 `{"PLAINS", "FOREST", "MOUNTAIN"}` 之一
+- 通过标准：不能冒出 `VOLCANO`、`TUNDRA` 等禁区地形
+
+**T03：PLAINS 出现概率 50% ± 5% 偏差验证**
+
+- 目的：验证哈希权重分配科学合理
+- 步骤：
+  1. 给定种子 `seed = 88888L`
+  2. 循环生成 1000 个新手区坐标 `(x = 1..1000, y = 1)` 的地形
+  3. 统计 `PLAINS` 出现次数
+- 断言：`PLAINS` 出现概率在 45%~55% 范围内（即 450~550 次）
+- 通过标准：概率分布符合预期
+
+**T04：坐标越界返回 null**
+
+- 目的：验证 5×5 范围外的坐标不返回模板
+- 步骤：
+  1. 调用 `getCampTemplate` 传入 `(5, 5)`、`(-3, 0)`、`(0, 3)` 等超出范围的坐标
+- 断言：所有超出范围的坐标均返回 `null`
+- 通过标准：模板边界严格
+
+---
+
+## 6. 测试框架要求
+
+- 使用 kotlin.test 断言库
+- 统计测试需大样本量（≥1000）验证概率分布
+- 每个测试方法独立，无执行顺序依赖
+- 禁止使用反射访问私有字段
+
+---
+
+## 7. 输出要求
+
+1. 仅输出 Kotlin 代码文件（MapGenTerrain.kt + MapGenTerrainTemplateTest.kt）
+2. 包含：TemplateTile、getCampTemplate、generateTerrainType、11 个硬编码坐标
+3. 不包含：怪物生成、Boss 生成、城邦生成逻辑
+4. 代码格式：遵循 Kotlin 官方约定
+
+---
+
+## 8. 模块边界说明
+
+**MDU 9.1（已完成）**：确定性哈希、欧氏距离分区
+**MDU 9.2（本章）**：大本营模板、动态地形权重
+**MDU 9.3（后续）**：怪物与城邦生成
+**MDU 9.4（后续）**：大本营初始模板注入
+**MDU 9.5（后续）**：延迟生成与缓存策略
+
+---
+
+## 9. 快速行为查阅
+
+**模板查询**：
+```
+getCampTemplate(Coordinate(0, 0))
+  → when 匹配 Coordinate(0, 0)
+  → 返回 TemplateTile("BASE_CAMP", "EXPLORED", null, null)
+
+getCampTemplate(Coordinate(5, 5))
+  → when 无匹配
+  → 返回 null
+
+getCampTemplate(Coordinate(-2, 0))
+  → 返回 TemplateTile("MOUNTAIN", "UNEXPLORED", "GOBLIN", 1)
+```
+
+**地形生成**：
+```
+generateTerrainType(88888L, 10, 10, STARTER_ZONE)
+  → w = hash(88888L, 10, 10) % 100
+  → 假设 w = 35
+  → w < 50 → 返回 "PLAINS"
+
+generateTerrainType(88888L, 100, 10, HIGH_ZONE)
+  → w = hash(88888L, 100, 10) % 100
+  → 假设 w = 75
+  → w >= 70 且 w < 85 → 返回 "VOLCANO"
+```

@@ -1,0 +1,177 @@
+# MDU 3.5: 全局混合并发守恒压测与语义冻结
+
+## 任务目标
+
+为 `EntityStateManager` 增补"事务守恒断言"行为规范与并发压力测试规约，验证在极高多线程交织负载下全局物质守恒律、金币守恒与脏流完整性的底层稳定性，并作出语义级冻结声明。
+
+**输出标准**：测试必须通过公开 API 验证，禁止反射；脏流必须完整核对；150 并发协程必须在 3 秒内完成无死锁。
+
+---
+
+## 1. 物质守恒守卫接口补充契约
+
+### 1.1 getTotalItemQuantity(item: String): Int
+
+```kotlin
+// 获取当前系统中指定物资的全局总量（跨所有村民背包与仓库库存之和）
+// 仅供内部测试用例使用的只读快照合计能力
+fun getTotalItemQuantity(item: String): Int
+```
+
+**实现要求**：
+- 遍历所有村民快照，累加每位村民背包中指定物资数量
+- 遍历所有仓库快照，累加每个仓库库存中指定物资数量
+- 返回两者之和
+- 纯只读查询，不加锁（仅在所有并发任务完成后调用）
+
+---
+
+## 2. 机械式步骤指令
+
+### 2.1 实现全局物资守恒汇总接口
+
+```kotlin
+fun getTotalItemQuantity(item: String): Int {
+    val villagerSum = villagers.values.sumOf { it.backpack[item] ?: 0 }
+    val warehouseSum = warehouses.values.sumOf { it.inventory[item] ?: 0 }
+    return villagerSum + warehouseSum
+}
+```
+
+### 2.2 构建 150 并发协程混合负载压力场景
+
+见下方测试规范第 3.1 节。
+
+---
+
+## 3. 禁止事项（硬性约束）
+
+1. **测试反射泄漏红线**：测试代码必须且仅能通过 `EntityStateManager` 的公开 API 读写数据，严禁通过 Java 反射或访问私有锁实例（如 `transactionMutex` 的内部等待队列），防止测试深度耦合实现细节。
+
+2. **脏数据流核对遗漏红线**：并发压力测试之后，必须订阅并核对 `stateDiffFlow` 发出的脏 ID 列表，校对其与实际发生变更的实体 ID 之间的完全匹配性，严禁跳过此步骤，防止脏标记丢失缺陷被遗漏隐匿。
+
+3. **禁止全局粗锁替代槽锁**：单实体字段更新必须使用 `computeIfPresent` 槽位锁，禁止用 `transactionMutex` 替代。
+
+4. **禁止超时死锁**：150 并发协程必须在 3 秒内完成，否则视为死锁或 Starvation 缺陷。
+
+---
+
+## 4. 测试规范：EntityStateManagerStressTest.kt
+
+### 4.1 测试原则
+
+⚠️ 黑盒测试强制规则：禁止使用反射或访问内部容器字段。所有验证必须通过公开 API 反映。
+
+⚠️ 脏流核对强制规则：压力测试后必须验证 `stateDiffFlow` 的脏 ID 与实际变更实体完全匹配。
+
+### 4.2 测试用例
+
+**T01：150 并发全局混合物资守恒压测**
+
+- 目的：验证极高并发下物质守恒律、金币守恒与脏流完整性
+- 初始化：
+  - 注册村民 1，背包 `{"WOOD" to 1000}`
+  - 注册仓库 2，容量 2000，库存 WOOD=0
+  - 全局金币 1000
+- 启动 150 并发协程（全部运行于 `Dispatchers.Default`）：
+  - **负载 A**（50 协程）：高频并发执行 `transferItemVillagerToWarehouse(villagerId=1, warehouseId=2, item="WOOD", amount=2)`，记录成功次数 N_success
+  - **负载 B**（50 协程）：高频交叉执行 `updateVillagerEnergy(id=1, 50)`，随机调用 `updatePlayerGold(-5)` 和 `updatePlayerGold(+5)` 震荡金币
+  - **负载 C**（50 协程）：独立对仓库 2 执行 `updateWarehouseInventory(id=2, "WOOD", +1)` 写入干扰，记录总增量 C_delta
+- 调用 `joinAll()` 等待所有并发任务完毕
+- 断言 1（全局防死锁）：150 个协程必须在 3 秒内顺利完成，绝无线程死锁或 Starvation
+- 断言 2（物质守恒律）：
+  - 获取村民 1 背包 WOOD：V_wood
+  - 获取仓库 2 库存 WOOD：W_wood
+  - 核验：V_wood == 1000 - 2 * N_success（负载 A 成功次数下扣准确）
+  - 核验：W_wood == 2 * N_success + C_delta（仓库收入两路来源均完整无漏）
+- 断言 3（脏流完整性）：
+  - 调用 `emitStateDiff()` 触发发射
+  - 订阅 `stateDiffFlow`
+  - 验证变更名单中村民 ID 1 与仓库 ID 2 均存在
+  - 脏标记插桩零丢失
+
+---
+
+## 5. 测试框架要求
+
+- 使用 kotlin.test 断言库
+- 并发测试使用 `kotlinx.coroutines` 协程和 `Dispatchers.Default`
+- 超时控制使用 `kotlinx.coroutines.withTimeout`
+- 每个测试方法独立，无执行顺序依赖
+- 禁止使用反射访问私有字段
+
+---
+
+## 6. 输出要求
+
+1. 仅输出 Kotlin 代码文件（EntityStateManager.kt 增量 + EntityStateManagerStressTest.kt）
+2. 包含：`getTotalItemQuantity` 实现、150 并发压测用例
+3. 不包含：业务逻辑、UI 绘制、AI 决策
+4. 代码格式：遵循 Kotlin 官方约定
+
+---
+
+## 7. 模块开发验收流程
+
+- [ ] **MDU 3.1**：状态模型及全局金币 CRUD 测试 100% 通过
+- [ ] **MDU 3.2**：五大实体单体原子更新及静默越界截断测试 100% 通过
+- [ ] **MDU 3.3**：跨实体原子转移事务负数与超容回滚测试 100% 通过
+- [ ] **MDU 3.4**：脏 ID 增量同步流发射及 Gson 复杂多态存档回环精度测试 100% 通过
+- [ ] **MDU 3.5**：本全局综合死锁及守恒压力回归测试 100% 通过
+
+---
+
+## 8. 语义级冻结声明
+
+当本 MDU 及其配套测试完全通过后，`EntityStateManager` 核心语义冻结。
+
+### 8.1 冻结语义边界
+
+1. **原子槽位更新锁定**：单实体字段的原子更新必须通过 `computeIfPresent` 槽位锁机制，禁止使用全局粗锁替代。
+
+2. **跨实体事务 Mutex 隔离**：跨实体资源调拨必须在 `transactionMutex.withLock` 下串行执行，确保物质守恒律物理成立。
+
+3. **脏流标记不丢失**：每一次写操作成功后必须插桩 dirtySet，`emitStateDiff()` 被调用后必须精确发射所有被修改实体的 ID。
+
+### 8.2 允许进化范围 (Permitted Evolutions)
+
+- 允许在实体快照类中扩展新字段（如 `moodLevel` 情绪值）
+- 扩展字段的并发读写必须沿用已建立的 `computeIfPresent` 原子槽锁规范
+- 写操作后必须同样触发 dirtySet 插桩
+
+---
+
+## 9. 快速行为查阅
+
+**守恒校验时序**：
+```
+150 并发协程执行完毕
+  → joinAll()
+  → V_wood = getVillager(1)?.backpack?.get("WOOD") ?: 0
+  → W_wood = getWarehouse(2)?.inventory?.get("WOOD") ?: 0
+  → assert(V_wood == 1000 - 2 * N_success)
+  → assert(W_wood == 2 * N_success + C_delta)
+  → 通过：物质守恒律成立
+```
+
+**脏流核对时序**：
+```
+emitStateDiff()
+  → stateDiffFlow.take(1).toList()
+  → diff = result[0]
+  → assert(diff.villagers.contains(1))
+  → assert(diff.warehouses.contains(2))
+  → 通过：脏标记无丢失
+```
+
+**死锁检测时序**：
+```
+withTimeout(3000) {
+    coroutineScope {
+        // 启动 150 并发协程
+        // ...
+    }
+}
+  → 3 秒内完成：通过
+  → 超时异常：死锁缺陷
+```

@@ -1,0 +1,93 @@
+# MDU 13.1: 工房生产枚举、配方表与队列状态容器 (MDU-A: Data Models & Recipes)
+
+作为 AI 工房生产与经营专家，你的任务是为工具制造管线定义完备的工具类型枚举、制造队列实时任务数据类、工房多槽位运行状态容器，并配置只读硬编码的静态工具生产配方矩阵。
+
+---
+
+## 1. 工房数据与配方契约 (Data Contract)
+
+在桥接器中定义以下核心枚举、任务状态类以及静态配方字典模型（确保数据在多槽位并发下的完全可见性）：
+
+```kotlin
+// 1. 六大核心工具类型枚举
+enum class ToolType {
+    STONE_AXE,       // 🪓 石斧
+    IRON_AXE,        // 🪓 铁斧
+    STONE_PICKAXE,   // ⛏️ 石镐
+    IRON_PICKAXE,    // ⛏️ 铁镐
+    BACKPACK,        // 🎒 纤维背包
+    WHEELBARROW      // 🛒 木质小推车
+}
+
+// 2. 工具制造队列中具体的一项任务记录（多线程并发读取时允许字段被 processTick 修改）
+data class ProductionTask(
+    val taskId: Long,
+    val toolType: ToolType,
+    val totalCount: Int,               // 本批次要求制造的总数量
+    var completedCount: Int,           // 目前已完成出库的数量
+    var currentProgress: Int,          // 当前正在制造的一个工具的 Tick 进度
+    val requiredTicks: Int             // 制造一个此工具所需的标准总 Tick 耗时
+)
+
+// 3. 工房实时多槽位运行状态快照
+data class WorkshopState(
+    val buildingId: Long,
+    val maxSlots: Int,                             // 并行制造槽位数（升级铁匠铺/科学院可增加）
+    val activeTasks: MutableList<ProductionTask>   // 活跃制造队列（支持高频安全增删）
+)
+
+// 4. 工具配方定义
+data class WorkshopRecipe(
+    val materialCost: Map<String, Int>,            // 材料消耗（如 "木材" to 5）
+    val requiredTicks: Int,                        // 生产单件标准耗时
+    val requiredTechId: String?                    // 前置科技解锁标志，null 代表开局可用
+)
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **工具配方字典篡改红线 (Strict Static Recipes)**：
+   六大工具的**耗材及科技限制必须静态硬编码锁定**，绝对禁止引入任何运行时动态扰动逻辑，维护资源循环流转的逻辑稳定度。
+2. **禁止擅自篡改进度字段**。
+
+### 机械式步骤指令：
+1. **硬编码静态配方字典配置**（在 `WorkshopEngine` 内部声明 `val recipes: Map<ToolType, WorkshopRecipe>`）：
+   - `STONE_AXE` (石斧)：木材 5，耗时 3 Tick，无科技限制。
+   - `IRON_AXE` (铁斧)：木材 5，铁矿 3，耗时 5 Tick，科技要求 `"IRON_FORGING"`。
+   - `STONE_PICKAXE` (石镐)：木材 5，耗时 3 Tick，无科技限制。
+   - `IRON_PICKAXE` (铁镐)：木材 5，铁矿 3，耗时 5 Tick，科技要求 `"IRON_FORGING"`。
+   - `BACKPACK` (背包)：纤维 10，耗时 2 Tick，无科技限制。
+   - `WHEELBARROW` (小推车)：木材 20，耗时 4 Tick，科技要求 `"BASIC_LOGISTICS"`。
+2. **构建高安全的并发状态字典**：
+   - 实例化 `class WorkshopEngine`。
+   - 内部维护并发安全的工房字典及全局自增任务 ID 发生器：
+     - `private val workshops = ConcurrentHashMap<Long, WorkshopState>()`
+     - `private val taskIdGenerator = AtomicLong(1L)`
+3. **提供工房状态注册与读取 API**：
+   - `fun registerWorkshop(buildingId: Long, maxSlots: Int)`：构造 `WorkshopState(buildingId, maxSlots, CopyOnWriteArrayList())` 并录入容器。
+   - `fun getWorkshopState(workshopId: Long): WorkshopState? = workshops[workshopId]`
+
+---
+
+## MDU 13.1-TEST: 工房配方静态矩阵与状态存储黑盒测试
+
+编写单元测试 `WorkshopRecipeAndStateTest.kt`。
+
+### 机械式测试用例：
+1. **石斧与铁镐静态配方造价精度校验**：
+   - 提取 STONE_AXE (石斧) 配方。
+   - **断言 1**：木材消耗精准等于 `5`，不需要任何科技（为 `null`）。
+   - 提取 IRON_PICKAXE (铁镐) 配方。
+   - **断言 2**：木材消耗为 `5`，铁矿为 `3`，且前置科技解锁标志必须是 `"IRON_FORGING"`。
+2. **工房状态注册隔离与空值防御测试**：
+   - 实例化 `WorkshopEngine`。
+   - 尝试读取不存在的工房 ID `9999L` 的状态。
+   - **断言 1**：返回结果严格为 `null`，拦截安全。
+   - 调用 `registerWorkshop(501L, 2)` 并再次读取。
+   - **断言 2**：状态快照成功获取，并行槽位数 `maxSlots` 精准为 `2`，活跃队列为空列表。
+
+### 交付物：
+只包含基础工具配方枚举、配方表静态映射字典、工房多槽位快照初始化与查询 API 实现、以及配方项精度的 JUnit 单元测试代码。不含任何材料扣减校验、时序心跳推进和制造中途退款退料逻辑。

@@ -1,0 +1,87 @@
+# MDU 10.1: 天气枚举、修正系数表与状态存储容器 (MDU-A: State & Modifiers Matrix)
+
+作为 AI 天气模拟与数值控制专家，你的任务是为游戏系统搭建完备的全局天气枚举、天气实时状态实体以及只读的天气全局修正系数矩阵，并设置安全的并发状态存储容器。
+
+---
+
+## 1. 天气状态与数值系数契约 (Data Contract)
+
+在桥接器中定义以下天气枚举、数值影响快照类及状态模型（确保隔离与完整性）：
+
+```kotlin
+// 1. 六大天气枚举类型
+enum class WeatherType {
+    CLEAR,      // ☀️ 晴天
+    OVERCAST,   // ☁️ 阴天
+    RAIN,       // 🌧️ 暴雨
+    DROUGHT,    // 🏜️ 干旱
+    SANDSTORM,  // 🌬️ 沙尘暴
+    COLD_WAVE   // ❄️ 寒潮
+}
+
+// 2. 全局天气物理属性/产量修正系数包（供 ActionProcessor 及寻路引擎每 Tick 读取）
+data class WeatherModifiers(
+    val moveSpeedMultiplier: Float,       // 移动速度倍率（正常 1.0）
+    val outdoorYieldMultiplier: Float,    // 户外基础产量倍率
+    val loggingYieldMultiplier: Float,    // 伐木特化产量倍率
+    val farmingYieldMultiplier: Float,    // 农田特化产量倍率
+    val miningYieldMultiplier: Float,     // 采石/采矿特化产量倍率
+    val energyCostMultiplier: Float,      // 村民行动体力消耗倍率（正常 1.0）
+    val foodConsumptionMultiplier: Float, // 村民额外食物消耗倍率（正常 1.0）
+    val fogVisionReduction: Int           // 迷雾视野缩减格数（正常 0）
+)
+
+// 3. 天气实时运行状态快照
+data class WeatherState(
+    val current: WeatherType,
+    val ticksRemaining: Int               // 当前天气剩余的维持 Tick 时间
+)
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **系数配置篡改红线 (Strict Hardcoded Coefficients)**：
+   本模块产出的全局修正矩阵**必须严格采用硬编码静态字典映射**，禁止引入任何运行时外部公式动态改写，防止物产系数突变导致领地物资膨胀或暴跌崩盘。
+2. **禁止参数空缺**：所有未指明的数值系数默认为 `1.0f`，缩减格数默认为 `0`。
+
+### 机械式步骤指令：
+1. **硬编码静态映射矩阵配置**（使用 `Map<WeatherType, WeatherModifiers>` 锁定）：
+   - **CLEAR (晴天)**：全参数为 `1.0f`，`fogVisionReduction = 0`。
+   - **OVERCAST (阴天)**：`outdoorYieldMultiplier = 0.9f`，其他参数为 `1.0f`。
+   - **RAIN (暴雨)**：`loggingYieldMultiplier = 1.5f`，`miningYieldMultiplier = 0.7f`，`farmingYieldMultiplier = 0.8f`，`moveSpeedMultiplier = 0.5f`，其他参数为 `1.0f`。
+   - **DROUGHT (干旱)**：`farmingYieldMultiplier = 0.3f`，`miningYieldMultiplier = 1.2f`，其他参数为 `1.0f`。
+   - **SANDSTORM (沙尘暴)**：`moveSpeedMultiplier = 0.6f`，`outdoorYieldMultiplier = 0.85f`，`fogVisionReduction = 2`，其他参数为 `1.0f`。
+   - **COLD_WAVE (寒潮)**：`outdoorYieldMultiplier = 0.8f`，`energyCostMultiplier = 1.5f`，`foodConsumptionMultiplier = 1.2f`，其他参数为 `1.0f`。
+2. **建立高安全的并发存储容器**：
+   - 实例化 `class WeatherEngine` 核心管理器。
+   - 内部定义线程安全的天气状态原子容器，开局默认为晴天，维持 10 ticks：
+     `private val state = AtomicReference(WeatherState(WeatherType.CLEAR, 10))`
+3. **编写数据提取 API**：
+   - `fun getCurrentWeather(): WeatherState = state.get()`
+   - `fun getModifiers(): WeatherModifiers`：提取当前天气 `state.get().current`，从配置矩阵中查表返回。若为空（理论上不可能），返回晴天默认全 1.0f 修正。
+
+---
+
+## MDU 10.1-TEST: 天气全局系数矩阵精度黑盒测试
+
+编写单元测试 `WeatherMatrixAccuracyTest.kt`。
+
+### 机械式测试用例：
+1. **晴天基准参数一致性测试**：
+   - 实例化天气引擎，默认启动。
+   - 调用 `getModifiers()`。
+   - **断言**：`moveSpeedMultiplier` 为 1.0f，`fogVisionReduction` 精准等于 0，符合晴天无干扰定义。
+2. **暴雨及干旱特化产量倍率精度测试**：
+   - 将内部状态切换至 `WeatherType.RAIN`（暴雨）。
+   - 调用 `getModifiers()`。
+   - **断言 1**：`loggingYieldMultiplier` 精准等于 `1.5f`（伐木特产增加）。
+   - **断言 2**：`moveSpeedMultiplier` 被压制到 `0.5f`，印证暴雨泥泞行军缓慢。
+   - 将内部状态切至 `WeatherType.DROUGHT`（干旱）。
+   - 调用 `getModifiers()`。
+   - **断言 3**：`farmingYieldMultiplier` 暴跌至 `0.3f`（农田颗粒无收），但 `miningYieldMultiplier` 上升至 `1.2f`（采石顺利）。
+
+### 交付物：
+只包含基础数据结构、全局硬编码系数映射表字典、原子引用状态读取接口实现、以及各天气参数精度校验的 JUnit 单元测试。不含任何 Tick 时序流转、随机天气刷新及 Flow 广播逻辑。

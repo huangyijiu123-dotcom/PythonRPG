@@ -1,0 +1,91 @@
+# MDU 15.3: 装备精炼强化、概率摇号与自动连续安全强化 (MDU-C: Upgrades & Refinements)
+
+作为 AI 装备锻造强化专家，你的任务是处理装备强化的概率波动判定、失败降级惩罚扣减、强化后带来的额外攻击/防御属性乘数计算，并封装面向脚本的“自动连续安全强化”循环接口。
+
+---
+
+## 1. 属性强化与连续安全强炼契约 (Upgrade & Refine Contract)
+
+在铁匠铺中实现核心的单次强化与连续强化接口（确保概率判断在外部随机扰动下的数值绝对安全）：
+
+```kotlin
+// 强化指定的装备（扣减该等级所需资源，然后概率决定升级或惩罚降级）
+// 返回值：true=强化成功，false=强化失败（包含材料不足、已达最高等级、装备不存在等所有失败情形）
+fun upgradeEquipment(equipmentId: Long): Boolean
+
+// 自动连续安全强化：由玩家或脚本调用，连续强化直到达到目标等级、材料不足或达到最高等级 10
+// 返回最终达到的等级
+fun upgradeTo(equipmentId: Long, targetLevel: Int): Int
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **最高等级溢出及降级穿透红线 (No Level Overrun & Negative Levels)**：
+   装备最高等级严密封顶为 `10`！**若当前装备已达 10 级，再次调用强化必须强行拦截返回 `false`**。强化失败后进行降级惩罚计算时，降级极限值必须为 `max(0, newLevel)`，**绝对禁止退回到负数等级**，坚守装备数值底线。
+2. **强化属性系数公式红线 (Refinement Stat Scaling)**：
+   强化带来的装备属性加成公式规定为：
+   $$\text{当前属性} = \lfloor \text{出厂基础属性} \times (1.0 + \text{当前等级} \times 0.1) + 10^{-9} \rfloor$$
+   *每级攻击/防御强度较出厂增加基础值的 10%（例如：20攻击的铁剑，+1是22，+3是26，+4是28，降回+2是24），所有运算必须在 Double 下并加 $10^{-9}$ 防抖，最终以 `toInt()` 精准截断存盘。*
+
+### 机械式步骤指令：
+1. **单次精炼强化数值结算算法实现 (`upgradeEquipment`)**：
+   - 步骤 A：获取装备镜像：`val eq = dependencyProvider.getEquipment(equipmentId) ?: return false`。
+   - 步骤 B：**封顶与规则提取**：
+     - 若 `eq.level >= 10`，强力返回 `false`。
+     - 获取当前等级对应的强化规则包：`val rule = getRefineRule(eq.level)`。
+   - 步骤 C：**材料划扣**：
+      - 拼装强化消耗：`val costs = mapOf("WOOD" to rule.woodCost, "STONE" to rule.stoneCost, "IRON_ORE" to rule.ironCost, "GOLD" to rule.goldCost, "OBSIDIAN" to rule.obsidianCost)`。
+      - 调用扣料：`val success = dependencyProvider.deductResources(costs)`。
+      - **若 `success` 为 `false`，代表玩家大仓库材料不足，直接返回 `false`（与其他引擎行为一致，禁止抛出异常）**。
+   - 步骤 D：**概率随机摇点 (RNG Roll)**：
+     - 生成 0.0 至 1.0 的随机数 `roll = Math.random()`（或者在单元测试中可 Mock 的注入式 random）。
+     - **判定 1：强化成功**（`roll < rule.successChance`）：
+       - 等级累加：`val newLvl = eq.level + 1`。
+       - 计算增益：`val newStat = (eq.baseStat.toDouble() * (1.0 + newLvl * 0.1) + 1e-9).toInt()`。
+       - 修改实体：`eq.level = newLvl`；`eq.currentStat = newStat`。
+       - 物理写回：`dependencyProvider.updateEquipment(eq)`，返回 `true`。
+     - **判定 2：强化失败**（`roll >= rule.successChance`）：
+       - 降级惩罚计算：`val newLvl = Math.max(0, eq.level - rule.downgradePenalty)`。
+       - 计算属性：`val newStat = (eq.baseStat.toDouble() * (1.0 + newLvl * 0.1) + 1e-9).toInt()`。
+       - 修改实体：`eq.level = newLvl`；`eq.currentStat = newStat`。
+       - 物理写回：`dependencyProvider.updateEquipment(eq)`，返回 `false`。
+2. **连续安全强化脚本封装实现 (`upgradeTo`)**：
+   - 使用 `while` 循环进行安全追赶：
+      - 查询数据库获取最新状态：`val currentLvl = dependencyProvider.getEquipment(equipmentId)?.level ?: return 0`。
+      - 若 `currentLvl >= targetLevel` 或 `currentLvl >= 10`，跳出循环。
+      - 尝试单次精炼强化，根据返回值决定是否继续：
+        `val canContinue = upgradeEquipment(equipmentId)`
+        `// upgradeEquipment 返回 false 可能是材料不足、也可能是强化失败降级，需判断当前等级有无继续空间`
+        `val latestLvl = dependencyProvider.getEquipment(equipmentId)?.level ?: break`
+        `if (!canContinue && latestLvl >= currentLvl) break` // 等级未增长且失败，说明材料耗尽，刹车
+   - 物理完工返回：拉取最新等级并返回。
+
+---
+
+## MDU 15.3-TEST: 精炼概率摇点分支判定、降级惩罚与连续强化安全停止测试
+
+编写单元测试 `ForgeRefinementUpgradeTest.kt`。
+
+### 机械式测试用例：
+1. **无惩罚阶段 (+3升+4) 强化失败等级保持测试**：
+   - Mock 装备数据库中有一件 3 级铁剑，耐久满，造价扣料设定必过。
+   - 重写摇号生成器：使得强化概率为 `1.0`（百分之百失败）。
+   - 尝试调用 `upgradeEquipment` 强化至 4。
+   - **断言 1**：方法返回 `false`，但因为 +3 没有退级惩罚，其状态属性依然稳固保持在 `3` 级，基础攻击依旧为 26（无磨损）。
+2. **惩罚阶段 (+4升+5) 强化失败级退级惩罚测试**：
+   - Mock 装备数据库存在一件 4 级铁剑。设定强化概率为 `1.0`（百分之百失败）。
+   - 调用 `upgradeEquipment`。
+   - **断言 1**：方法返回 `false`。
+   - **断言 2**：因为 +4 升 +5 的降级惩罚为 `1`，铁剑等级瞬间回滚为 `3` 级，攻击属性回滚为 26。
+3. **连续安全强化物料枯竭自动刹车测试**：
+   - 准备一柄 0 级铁剑，目标直奔 +10 级。
+   - 设定材料划扣：第一次呼叫可以通过（升至 +1）；第二次扣料时库存枯竭，扣除器返回 `false`（upgradeEquipment 直接返回 `false`，不抛异常）。
+   - 调用 `upgradeTo(eqId, 10)`。
+   - **断言 1**：方法在一瞬间检测到等级未增长，跳出循环，绝对未陷入死循环卡死。
+   - **断言 2**：拉取数据库，最终铁剑等级在资源枯竭前安全停留在 +1 级。
+
+### 交付物：
+只包含 `upgradeEquipment` 单次强化、`upgradeTo` 连续强化脚本 API 实现、属性加成防抖换算公式、以及 RNG 失败和连续强化停止的 JUnit 单元测试代码。不含心跳排单制造和装备修理扣铁矿折旧费用算法。

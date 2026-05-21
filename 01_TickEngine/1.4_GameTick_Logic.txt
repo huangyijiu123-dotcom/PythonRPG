@@ -1,0 +1,316 @@
+markdown复制# MDU 1.4: 逻辑心跳变速、时段换算与双轨隔离
+
+## 任务目标
+
+编写 24 小时时段换算函数，在
+协程循环中以变速间隔发射包含时段换算结果的 `TickEvent`，并完善所有暂停/恢复控制 API。
+
+**输出标准**：代码必须通过 Kotlin 编译，时段换算命中率达到 100%，累加器在暂停期间不得重置。
+
+---
+
+## 1. 24 小时时段换算契约（不可更改）
+
+### 1.1 时段判定规则
+
+**MORNING**：tickId % 24 == 1
+**DAYTIME**：tickId % 24 in 2..14
+**TWILIGHT**：tickId % 24 in 15..16
+**NIGHT**：tickId % 24 in 17..23 或 tickId % 24 == 0（含 tickId=0 初始状态）
+
+### 1.2 换算函数实现
+
+```kotlin
+private fun calculateTimePeriod(tickId: Long): TimePeriod {
+    val remainder = Math.floorMod(tickId, 24L)
+    return when (remainder) {
+        1L -> TimePeriod.MORNING
+        in 2..14L -> TimePeriod.DAYTIME
+        in 15..16L -> TimePeriod.TWILIGHT
+        else -> TimePeriod.NIGHT  // 0 或 17..23
+    }
+}
+行为约束：
+
+使用 tickId % 24 取余，确保余数始终在 [0, 23] 范围内
+tickId 为负数时需用 Math.floorMod(tickId, 24) 替代以确保正余数
+when 分支必须穷举所有 24 种情况或使用 else 兜底
+
+2. 累加器与事件发射循环
+2.1 累加器变量声明
+kotlin复制// 在 TickEngine 类内部声明（MDU 1.1~1.3 的原子变量之后）
+private var accumulator = 0L  // 用于追踪自上一 Tick 以来的累积毫秒数
+2.2 while 循环内完整逻辑
+```kotlin
+fun start(initialTick: Long = 0) {
+    startMutex.withLock {
+        stopInternal()
+        currentTickId.set(initialTick)
+        accumulator = 0L // 重置累加器
+        isEnginePaused.set(false)
+        isLogicPaused.set(false)
+
+        engineJob = scope.launch {
+            while (isActive) {
+                delay(50L)
+
+                // === UI 高频心跳（MDU 1.2）===
+                if (!isEnginePaused.get()) {
+                    _realTickFlow.tryEmit(System.currentTimeMillis())
+                }
+
+                // === 逻辑心跳变速累加（MDU 1.4）===
+                // 注意：即使 isEnginePaused == true，累加器仍继续累加，保证恢复时的时间精度
+                accumulator += 50L
+                val currentInterval = intervalMs.get()
+
+                if (accumulator >= currentInterval) {
+                    accumulator %= currentInterval  // 取模保留余数，不清零
+
+                    // 只有在引擎和逻辑均未暂停时才发射 Tick
+                    if (!isEnginePaused.get() && !isLogicPaused.get()) {
+                        val newTick = currentTickId.incrementAndGet()
+                        val timePeriod = calculateTimePeriod(newTick)
+                        val event = TickEvent(
+                            tickId = newTick,
+                            timestamp = System.currentTimeMillis(),
+                            timeOfDay = timePeriod
+                        )
+                        _tickFlow.tryEmit(event)
+                    }
+                }
+            }
+        }
+    }
+}
+2.3 累加器行为约束（重要）
+⚠️ 暂停期间累加器不得重置：当 isLogicPaused == true 时，累加器继续累积 +50L，但不清零。若重置累加器会导致恢复后额外等待一整个 intervalMs。
+正常运行：accumulator += 50L，达到 intervalMs 时发射并取模
+isLogicPaused == true：accumulator += 50L 继续，但不发射，accumulator 保留
+isEnginePaused == true：整个 while 循环的 delay 照常执行，但两个 Flow 均不发射
+resumeLogic() 后：accumulator 继承暂停前的值，继续累加
+防突变积压：使用 `accumulator %= currentInterval` 而非 `= 0L`，保留余数以维持时间精度。
+动态变速时的余数保留：当调用 `setGameSpeed` 改变 `intervalMs` 时，`accumulator` 的当前值不重置，并在下次 Tick 检查时直接按新的 `currentInterval` 取模。例如间隔从 5000 变为 500，累加器为 4800，取模后直接变为 300，导致逻辑 Tick 迅速响应。这是预期的“即时反应”行为。
+3. 控制 API 完整实现
+3.1 pauseEngine() / resumeEngine()
+```kotlin
+fun pauseEngine() {
+    isEnginePaused.set(true)
+    // 遵循 MDU 1.1，不改变 isLogicPaused 状态
+}
+
+fun resumeEngine() {
+    isEnginePaused.set(false)
+    // 遵循 MDU 1.1，不改变 isLogicPaused 状态
+}
+```
+3.2 pauseLogic() / resumeLogic()
+```kotlin
+fun pauseLogic() {
+    isLogicPaused.set(true)
+    // accumulator 继续累积，不重置
+}
+
+fun resumeLogic() {
+    isLogicPaused.set(false)
+    // 恢复后自然继续累加，下一 Tick 在剩余时间后触发
+}
+```
+3.3 setGameSpeed(newIntervalMs: Long)
+```kotlin
+fun setGameSpeed(newIntervalMs: Long) {
+    if (newIntervalMs <= 0L) return // 遵循 MDU 1.1 契约：忽略非正值
+    val clamped = newIntervalMs.coerceIn(500L, 60_000L) // 业务上下限钳位
+    intervalMs.set(clamped)
+}
+```
+边界约束：
+
+下限 500ms：防止过高频心跳导致 CPU 过载
+上限 60,000ms：防止误设超大值导致游戏心跳实质失效
+无效值处理：小于等于 0 被忽略，超出 500~60000 区间的正数值会被 `coerceIn` 自动钳位到最近的边界值。
+
+3.4 只读查询 API
+kotlin复制fun isEnginePaused(): Boolean = isEnginePaused.get()
+fun isLogicPaused(): Boolean = isLogicPaused.get()
+fun getCurrentTickId(): Long = currentTickId.get()
+4. 双轨行为总览
+isEnginePaused == true：
+
+realTickFlow：不发射
+tickFlow：不发射
+accumulator：+= 50L 继续
+
+isLogicPaused == true：
+
+realTickFlow：照常发射
+tickFlow：不发射
+accumulator：+= 50L 继续
+
+isEnginePaused == false 且 isLogicPaused == false：
+
+realTickFlow：发射
+tickFlow：达到间隔时发射
+accumulator：达标时取模重置
+
+5. 禁止事项（硬性约束）
+
+累加器重置红线：pauseLogic() 期间严禁重置 accumulator，违者导致恢复后额外等待一整个 intervalMs
+业务数据混入红线：realTickFlow 只携带 Long（毫秒时间戳），禁止携带 TickEvent
+时段换算硬编码红线：禁止硬编码 tickId == 1 判断，必须使用 tickId % 24 == 1
+
+6. 测试规范：TickEngineGameTickTest.kt
+6.1 虚拟时间规避规则（必读）
+⚠️ 订阅先于触发：由于 replay = 0，Flow 在订阅前发射的事件会丢失。测试必须遵循：先 launch 挂起订阅，再调用 start() 或 advanceTimeBy()，最后取消订阅并验证。
+6.2 测试用例
+T01：24 小时时段换算精确校验
+
+目的：验证每个 tickId 的时段判定严格符合契约
+步骤：
+
+setGameSpeed(500L) → 每 500ms 一个逻辑 Tick
+start(initialTick = 0)
+先订阅 tickFlow：val events = mutableListOf<TickEvent>(); scope.launch { tickFlow.toList(events) }
+advanceTimeBy(13_000) → 推进 26 个 Tick
+取消订阅并验证
+
+
+断言：
+
+tickId=1 的 timeOfDay 为 MORNING
+tickId=2…14 的 timeOfDay 为 DAYTIME
+tickId=15…16 的 timeOfDay 为 TWILIGHT
+tickId=17…23, 0 的 timeOfDay 为 NIGHT
+
+
+通过标准：所有 26 个事件的 timeOfDay 与契约完全一致
+
+T02：逻辑冻结（晨会）双轨隔离测试
+
+目的：验证 pauseLogic() 期间 tickFlow 冻结但 realTickFlow 继续
+步骤：
+
+start()
+先订阅两个 Flow
+advanceTimeBy(200) → 正常发射约 4 个 tick
+pauseLogic()
+advanceTimeBy(5_000) → 暂停 5 秒
+resumeLogic()
+advanceTimeBy(200) → 恢复后约 4 个 tick
+
+
+断言：
+
+A1：步骤3后 tickEvents.size >= 3
+A2：步骤5后 tickEvents.size 无变化（tickFlow 冻结）
+A3：步骤5后 uiHeartbeats.size 增长了约 100 次（5000ms/50ms）
+A4：步骤7后 tickEvents.size 继续增长
+
+
+通过标准：双轨隔离正确
+
+T03：晨会暂停后恢复节拍精度测试（陷阱典型 bug）
+
+目的：验证 pauseLogic() 期间累加器未被重置，恢复后立即发射 Tick
+⚠️ 典型实现陷阱：有些实现会在 pauseLogic() 时错误地执行 accumulator = 0L，导致恢复后额外等待一整个 intervalMs
+步骤：
+
+setGameSpeed(500L)
+start()
+先订阅 tickFlow
+advanceTimeBy(450) → 进行到第一个 Tick 的 90%（还差 50ms）
+pauseLogic()
+advanceTimeBy(5_000) → 暂停 5 秒
+resumeLogic()
+advanceTimeBy(100) → 恢复后应在 50~100ms 内累加器达到 500ms 立即发射
+
+
+断言：
+
+A1：events 在步骤8的 200ms 内收到至少 1 个新 Tick
+A2：不应需要完整的 500ms 等待
+
+
+通过标准：恢复后立即发射，恢复延迟 <= 150ms
+
+T04：setGameSpeed() 动态调速与边界约束验证
+
+目的：验证 `setGameSpeed()` 的非正值忽略以及 `coerceIn` 边界约束
+步骤：
+
+start()
+setGameSpeed(-100L) → 非正值，应被忽略（保持默认 5000L）
+setGameSpeed(100L) → 正数但低于下限，应被修正为 500ms
+advanceTimeBy(2_000) → 应收到约 4 个 Tick
+setGameSpeed(999_999L) → 高于上限，应被修正为 60000ms
+advanceTimeBy(130_000) → 应收到约 2 个 Tick
+
+
+断言：
+
+A1：下限测试中，2000ms 内收到约 4 个 Tick
+A2：上限测试中，130000ms 内收到约 2 个 Tick
+
+
+通过标准：边界值被正确钳制
+
+T05：多轮 start/stop 累加器隔离测试
+
+目的：验证每次 start() 重新初始化累加器
+步骤：
+
+setGameSpeed(500L) → start() → advanceTimeBy(400) → stop()
+start() → advanceTimeBy(600) → 订阅 tickFlow
+
+
+断言：
+
+A1：第一次 start 后 accumulator = 400，未发射 Tick
+A2：第二次 start 后 accumulator 重置为 0
+A3：第二次 start 后 600ms 内收到至少 1 个 Tick
+
+
+通过标准：每次启动累加器正确重置
+
+7. 测试框架要求
+
+使用 kotlinx.coroutines.test.TestScope
+使用 kotlin.test 断言库
+订阅使用 toList(results) 挂起收集器
+每个测试独立，无执行顺序依赖
+
+8. 输出要求
+
+仅输出 Kotlin 代码文件（TickEngine.kt 更新 + TickEngineGameTickTest.kt）
+包含：时段换算函数、累加器逻辑、控制 API 完整实现
+不包含：时段换算、暂停/恢复以外的业务逻辑
+
+9. 快速行为查阅
+累加器状态转移：
+
+启动 → accumulator = 0
+每 50ms → accumulator += 50
+accumulator >= intervalMs → accumulator %= intervalMs，发射 Tick
+暂停逻辑 → accumulator 继续累加，不清零
+恢复逻辑 → accumulator 继承暂停前值
+
+时段判定：
+
+tickId=0 → NIGHT
+tickId=1 → MORNING
+tickId=2…14 → DAYTIME
+tickId=15…16 → TWILIGHT
+tickId=17…23 → NIGHT
+tickId=24 → NIGHT (24 % 24 == 0)
+
+变速逻辑：
+
+正常速度 5000ms → 每 5 秒一个逻辑 Tick
+加速 1000ms → 每 1 秒一个逻辑 Tick
+减速 30000ms → 每 30 秒一个逻辑 Tick
+
+10. MDU 1.1~1.4 模块边界总览
+MDU 1.1：骨架：枚举、数据类、原子变量、API 签名 ✅
+MDU 1.2：双轨 SharedFlow 声明、50ms UI 心跳循环 ✅
+MDU 1.3：start() Mutex 排他锁、stop() 双标志位归零 ✅
+MDU 1.4：时段换算、累加器逻辑、变速控制 API ⬜ 本章

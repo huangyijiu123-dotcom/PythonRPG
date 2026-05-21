@@ -1,0 +1,220 @@
+# MDU 2.4: 并发隔离批量写入与大范围防撕裂
+
+## 任务目标
+
+在上一步的基础上，引入协程互斥机制，解决大范围地图刷新与大区域读取时由于时序导致的"半更新撕裂/脏读"数据不一致性。
+
+**输出标准**：批量写入与区域读取必须升级为 `suspend` 函数，通过 `Mutex` 互斥锁保证原子性；单点操作保持无锁高并发。
+
+---
+
+## 1. 核心接口契约（不可更改方法签名）
+
+### 1.1 batchUpdateTiles(tiles: List<TileData>)
+
+```kotlin
+// 批量覆盖或写入多个格子
+// 在写入全过程中加互斥锁隔离，避免其他线程在此读取到"半截"新值
+suspend fun batchUpdateTiles(tiles: List<TileData>)
+```
+
+### 1.2 getTilesInRegion(x1: Int, y1: Int, x2: Int, y2: Int): List<TileData>
+
+```kotlin
+// 升级版区域拉取：为保证读取时数据处于完全隔离状态，升级为挂起函数
+// 注意：此方法签名与 MDU 2.3 不同，现在是 suspend 函数
+suspend fun getTilesInRegion(x1: Int, y1: Int, x2: Int, y2: Int): List<TileData>
+```
+
+---
+
+## 2. 撕裂缺陷与互斥锁规范
+
+### 2.1 脏读数据撕裂陷阱
+
+当以下情况同时发生时会触发数据撕裂：
+- 地图生成器或同步模块在子线程通过 `batchUpdateTiles` 批量写入 500 个格子
+- 读线程正好在同一时间执行 `getTilesInRegion` 扫描同一个范围
+
+**结果**：读线程可能在扫描到第 250 个格子时读到新值，而后半截依然是旧值。这种"撕裂状态"会导致后续的寻路引擎或视野计算发生逻辑冲突甚至崩溃。
+
+### 2.2 声明批量锁
+
+```kotlin
+private val batchMutex = Mutex()
+```
+
+### 2.3 实现隔离批量写入
+
+```kotlin
+suspend fun batchUpdateTiles(tiles: List<TileData>) {
+    batchMutex.withLock {
+        for (tile in tiles) {
+            val key = packToLong(tile.coordinate.x, tile.coordinate.y)
+            tileMap[key] = tile
+        }
+    }
+}
+```
+
+### 2.4 升级隔离区域读取
+
+```kotlin
+suspend fun getTilesInRegion(x1: Int, y1: Int, x2: Int, y2: Int): List<TileData> {
+    return batchMutex.withLock {
+        val minX = minOf(x1, x2)
+        val maxX = maxOf(x1, x2)
+        val minY = minOf(y1, y2)
+        val maxY = maxOf(y1, y2)
+        
+        val dx = maxX - minX + 1
+        val dy = maxY - minY + 1
+        val estimatedCapacity = minOf(size(), dx * dy)
+        val result = ArrayList<TileData>(estimatedCapacity)
+        
+        for (x in minX..maxX) {
+            for (y in minY..maxY) {
+                val key = packToLong(x, y)
+                val tile = tileMap[key]
+                if (tile != null) {
+                    result.add(tile)
+                }
+            }
+        }
+        result
+    }
+}
+```
+
+---
+
+## 3. 性能红线隔离（硬性约束）
+
+1. **禁止对单点操作加锁**：绝对禁止将 `getTile`、`setTile` 以及单键原子更新方法（`updateExploreStatus`、`updateMonsterPresence`、`updateBuilding`）加上 `batchMutex`！
+
+   **原因**：`ConcurrentHashMap` 已经为单点操作提供了完美的并发槽锁，单点读取/写入应保持完全无阻塞的高并发吞吐。锁仅针对连续性的大范围写入和读取。
+
+2. **禁止阻塞主线程**：所有批量操作必须是 `suspend` 函数，由调用方在协程中调度，避免阻塞 Android UI 线程。
+
+3. **禁止锁内调用可挂起函数**：在 `batchMutex.withLock` 闭包内，禁止调用其他可能挂起的函数，避免死锁风险。
+
+---
+
+## 4. 禁止事项（硬性约束）
+
+1. **禁止单点操作加批量锁**：`getTile`、`setTile`、`updateXXX` 方法保持无锁，仅依赖 `ConcurrentHashMap` 槽锁。
+
+2. **禁止批量锁嵌套**：不要在 `batchMutex.withLock` 内部再获取其他锁。
+
+3. **禁止锁内阻塞**：锁闭包内禁止调用 `delay`、`withContext` 等挂起函数。
+
+4. **禁止遗漏 size() 容量预估**：创建 ArrayList 时仍需预估容量避免扩容。
+
+---
+
+## 5. 测试规范：GridMapDataConcurrencyTest.kt
+
+### 5.1 测试原则
+
+⚠️ 并发测试强制规则：必须在真实多线程环境下运行（`Dispatchers.Default`），不能在单线程测试中模拟。
+
+⚠️ 撕裂检测强制规则：高频循环读取必须验证从未出现中间态大小。
+
+### 5.2 测试用例
+
+**T01：数据半更新防撕裂（脏读防御）测试**
+
+- 目的：验证批量写入与区域读取的原子隔离性
+- 步骤：
+  1. 实例化 `GridMapData`，初始处于完全清空状态
+  2. 预设 500 个格子数据，坐标从 `Coordinate(0, 0)` 到 `Coordinate(499, 0)`
+  3. 启动协程 A（分配在 `Dispatchers.Default` 多线程环境中）：调用 `batchUpdateTiles(tiles)` 写入这 500 个格子
+  4. 在同一时刻启动协程 B（同样运行在并发线程池）：循环高频调用 `getTilesInRegion(0, 0, 499, 0)` 并记录返回列表的 `size`
+- 核心断言：协程 B 在高频循环读取中，每一次拉取到的格子列表大小，**必须要么是 0（完全旧值），要么是 500（完全新值）**
+- 禁止断言：严禁读到任何诸如 `127`、`301` 或 `499` 等半更新中间态大小。如果出现，直接抛出测试失败
+- 通过标准：批量隔离机制坚不可摧，无任何撕裂读取
+
+**T02：100 协程高并发写防丢失测试**
+
+- 目的：验证单点高并发写入不会丢失数据
+- 步骤：
+  1. 启动 100 个并发协程
+  2. 每个协程分别对 100 个不同的坐标 `Coordinate(i, i)`（i 为 0..99）调用 `setTile` 进行写入
+  3. 等待所有协程并发执行结束
+- 断言：调用 `size()` 必须精确等于 100
+- 通过标准：没有发生因并发操作导致的数据包丢失或 `ConcurrentHashMap` 扩容抛错
+
+---
+
+## 6. 测试框架要求
+
+- 使用 kotlin.test 断言库
+- 并发测试使用 `kotlinx.coroutines.test.runTest`
+- 多线程环境使用 `Dispatchers.Default`
+- 每个测试方法独立，无执行顺序依赖
+- 禁止使用反射访问私有字段
+- 撕裂检测需在循环中多次断言，非单次采样
+
+---
+
+## 7. 输出要求
+
+1. 仅输出 Kotlin 代码文件（GridMapData.kt 增量 + GridMapDataConcurrencyTest.kt）
+2. 包含：`batchMutex` 声明、两个 `suspend` 方法实现、完整的撕裂防御测试
+3. 不包含：序列化广播、脏流逻辑
+4. 代码格式：遵循 Kotlin 官方约定
+
+---
+
+## 8. 模块边界说明
+
+**MDU 2.1（已完成）**：状态模型、坐标压缩、基础读写
+**MDU 2.2（已完成）**：局部属性原子更新、十字视野解锁
+**MDU 2.3（已完成）**：零分配区域查询、条件过滤
+**MDU 2.4（本章）**：批量写入隔离、防撕裂互斥锁
+**MDU 2.5（后续）**：脏坐标流与完整性校验
+
+---
+
+## 9. 快速行为查阅
+
+**批量写入时序**：
+```
+batchUpdateTiles(tiles)
+  → batchMutex.withLock {
+      for (tile in tiles) {
+        key = packToLong(tile.coordinate.x, tile.coordinate.y)
+        tileMap[key] = tile
+      }
+    }
+  → 写入完成，释放锁
+```
+
+**隔离读取时序**：
+```
+getTilesInRegion(0, 0, 499, 0)
+  → batchMutex.withLock {
+      // 双重循环遍历
+      // 收集所有存在格子到 result
+      return result
+    }
+  → 读取完成，释放锁
+```
+
+**并发隔离保证**：
+```
+协程 A: batchUpdateTiles(500 tiles)
+协程 B: getTilesInRegion(0, 0, 499, 0)
+  → Mutex 串行化两者的执行
+  → 协程 B 要么看到 0 个格子（A 未开始）
+  → 要么看到 500 个格子（A 已完成）
+  → 绝不会看到 250 个格子（半截撕裂）
+```
+
+**单点操作保持无锁**：
+```
+getTile(x, y) → 无 batchMutex，直接查询 ConcurrentHashMap
+setTile(tile) → 无 batchMutex，直接写入 ConcurrentHashMap
+updateXXX(...) → 无 batchMutex，computeIfPresent 槽锁
+  → 单点操作保持高并发吞吐
+```

@@ -1,0 +1,83 @@
+# MDU 14.1: 科技树结构与配置初始化 (MDU-A: Nodes & Config)
+
+作为 AI 科技树管理专家，你的任务是为科技树系统定义完备的科技节点数据类、运行状态枚举，并在初始化时预装载全部 13 个科技节点的静态依赖图与造价配置字典。
+
+---
+
+## 1. 科技数据与依赖树契约 (Data Contract)
+
+在桥接器中定义以下核心枚举、节点模型及容器接口（确保科技状态的并发读取安全性）：
+
+```kotlin
+// 1. 四大科研运转状态
+enum class TechState {
+    LOCKED,      // 未解锁且前置依赖不满足，封锁中
+    AVAILABLE,   // 前置科技已解锁完毕，已备齐条件，可点击/开始研究
+    RESEARCHING, // 研究考核中（已暂存质押对应物资，等待沙盒考核）
+    UNLOCKED     // 代码考核通过，正式解锁并激活全局特权
+}
+
+// 2. 科技树节点快照实体
+data class TechNode(
+    val techId: String,
+    val cost: Map<String, Int>,               // 研发所需物资（如 "木材" to 200）
+    val prerequisites: List<String>,          // 前置依赖科技 ID 树链
+    var state: TechState
+)
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **静态依赖关系错漏红线 (Strict Prerequisites Mapping)**：
+   13 个科技节点的**研发费用及前置科技依赖网格必须严格采用只读静态配置**，禁止在运行时动态增删依赖，防止科技环形死锁或条件残缺。
+2. **禁止参数漏设**。
+
+### 机械式步骤指令：
+1. **硬编码 13 个科技节点数据网格装配**（在 `TechEngine` 内部声明 ConcurrentHashMap 容器）：
+   - `BASIC_MANAGEMENT` (基础管理学)：免费，无前置 $\rightarrow$ 初始状态设为 `TechState.AVAILABLE`。
+   - `BACKPACK_WEAVING` (背包编织)：木材 50，前置：`BASIC_MANAGEMENT` $\rightarrow$ 初始状态 `TechState.LOCKED`。
+   - `WHEELBARROW` (小推车)：木材 200，前置：`BACKPACK_WEAVING` $\rightarrow$ `LOCKED`。
+   - `STONE_TOOLS` (石制工具)：木材 150，前置：`BASIC_MANAGEMENT` $\rightarrow$ `LOCKED`。
+   - `IRON_FORGING` (铁器锻造)：铁矿 300，前置：`STONE_TOOLS` $\rightarrow$ `LOCKED`。
+   - `ADVANCED_BUILDING` (高级建筑学)：石材 500，前置：`BASIC_MANAGEMENT` $\rightarrow$ `LOCKED`。
+   - `WORKSHOP_OPTIMIZATION` (工坊优化)：石材 300，前置：`STONE_TOOLS` $\rightarrow$ `LOCKED`。
+   - `LOGISTICS_DISPATCH` (物流调度)：金币 200，前置：`WHEELBARROW` $\rightarrow$ `LOCKED`。
+   - `DISTRIBUTION_CENTER` (分拨中心)：石材 300, 金币 200，前置：`LOGISTICS_DISPATCH` 和 `ADVANCED_BUILDING` $\rightarrow$ `LOCKED`。
+   - `RADIATION_EXPANSION` (辐射扩展)：金币 500，前置：`DISTRIBUTION_CENTER` $\rightarrow$ `LOCKED`。
+   - `ADVANCED_EXPLORATION` (高级探索)：金币 300，前置：`DISTRIBUTION_CENTER` $\rightarrow$ `LOCKED`。
+   - `ARCHEOLOGY` (考古学)：古物 5, 金币 100，前置：`BASIC_MANAGEMENT` $\rightarrow$ `LOCKED`。
+   - `CRYPTOGRAPHY` (密码学)：金币 500，前置：`ARCHEOLOGY` $\rightarrow$ `LOCKED`。
+2. **构建高安全的并发状态字典**：
+   - 实例化 `class TechEngine`。
+   - 内部维护并发安全的科技树节点容器字典：
+     `private val nodes = ConcurrentHashMap<String, TechNode>()`
+3. **提供状态获取与查询 API**：
+   - `fun getTechState(techId: String): TechState = nodes[techId]?.state ?: TechState.LOCKED`
+   - `fun isTechUnlocked(techId: String): Boolean = getTechState(techId) == TechState.UNLOCKED`
+   - `fun getTechTreeSnapshot(): List<TechNode> = nodes.values.toList()`
+
+---
+
+## MDU 14.1-TEST: 科技节点配置与依赖关系初始化黑盒测试
+
+编写单元测试 `TechConfigAndInitTest.kt`。
+
+### 机械式测试用例：
+1. **基础免费科技 AVAILABLE 开局初态测试**：
+   - 实例化 `TechEngine`。
+   - 获取 `BASIC_MANAGEMENT` 的状态。
+   - **断言**：状态必须为 `TechState.AVAILABLE`，证明无条件科技开局可用。
+2. **铁器锻造及密码学造价精度与依赖测试**：
+   - 检索 `IRON_FORGING` 节点。
+   - **断言 1**：前置依赖包含且仅包含 `"STONE_TOOLS"`，初始状态为 `LOCKED`，需要 300 铁矿。
+   - 检索 `CRYPTOGRAPHY` 密码学节点。
+   - **断言 2**：研发需要 500 金币，且前置依赖精确为 `"ARCHEOLOGY"`。
+3. **只读快照列表大小完整性测试**：
+   - 调用 `getTechTreeSnapshot()`。
+   - **断言**：返回列表的大小必须精确等于 `13`，保障沙盒评估面板科技节点无遗漏。
+
+### 交付物：
+只包含基础状态枚举、科技节点实体类、13 节点初始化构建器、只读查询 API 实现、以及静态参数和初态的 JUnit 单元测试代码。不含任何资源质押质扣、撤销及考核解锁锁链级联。

@@ -1,0 +1,61 @@
+# MDU 10.2: 确定性与概率流转天气状态自运转步进机 (MDU-B: Tick Progression & State Transitions)
+
+作为 AI 天气模拟专家，你的任务是为 `WeatherEngine` 植入对接主循环的“Tick 时序步进驱动层”，并设计防单一天气无限占领的“概率异色天气自切换状态机”。
+
+---
+
+## 1. 时序推进与状态流转契约 (Interface Contract)
+
+在 `WeatherEngine` 中声明并实现以下时钟推进接口（确保时序操作的原子写回安全性）：
+
+```kotlin
+// 外部中央大循环（GameLoopCoordinator 或 TickEngine）在每 Tick 推进时，主动调用此接口驱动天气系统
+// 本方法执行倒计时递减并在归零时触发天气随机迭代，确保自封闭性
+fun processTick()
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **天气同色连庄红线 (No Repetitive Weather Rollover)**：
+   一旦天气持续时间到期（`ticksRemaining == 0`）触发随机切换时，**绝对禁止再次随机到与当前一模一样的天气**！状态机必须强制在其余 5 种异色天气中进行等概率选择（即必须从 `WeatherType.values().filter { it != current }` 中筛选），保证游戏天候变化的丰富度和玩家新鲜感。
+2. **禁止持续时间越界**：新天气的随机持续时长必须严格卡死在 `[8, 16]` Ticks 范围内（包含极值，即 `Random.nextInt(8, 17)`）。
+
+### 机械式步骤指令：
+1. **原子步进倒计时递减计算 (`processTick`)**：
+   - 步骤 A：获取当前的原子天气快照 `val currentVal = state.get()`。
+   - 步骤 B：**倒计时判断与自递减**：
+     - 若 $ticksRemaining > 1$（代表天气尚未到期）：
+       - 创建递减的新状态：`val nextVal = WeatherState(currentVal.current, currentVal.ticksRemaining - 1)`。
+       - 调用 `state.compareAndSet(currentVal, nextVal)`（循环 CAS 确保多线程并发写的安全性）。
+     - 若 $ticksRemaining \le 1$（代表当前天气已完美谢幕，开始气候流转）：
+       - **异色天候等概率摇号**：过滤掉当前天候 `val candidatePool = WeatherType.values().filter { it != currentVal.current }`。
+       - 从池子中均匀摇号一个新天气：`val newWeather = candidatePool.random()`。
+       - **动态时长摇号**：摇出新天气的持续 Tick 数：`val nextDuration = Random.nextInt(8, 17)`（严格满足 8~16 ticks，即至少持续 4 Tick 协议的加强版限制）。
+       - 构造切换状态：`val nextVal = WeatherState(newWeather, nextDuration)`。
+       - 采用 CAS 将其安全更新：`state.compareAndSet(currentVal, nextVal)`。
+
+---
+
+## MDU 10.2-TEST: 时钟递减自运转与异色天气流转黑盒测试
+
+编写单元测试 `WeatherTickProgressionTest.kt`。
+
+### 机械式测试用例：
+1. **时钟倒计时安全递减测试**：
+   - 设定天气为 `WeatherState(WeatherType.CLEAR, 5)`。
+   - 调用一次 `processTick()`。
+   - **断言**：获取当前天气状态，`current` 依然为晴天 `CLEAR`，但 `ticksRemaining` 精准自减为 `4`。
+2. **倒计时到期强制切换异色天气测试**：
+   - 设定天气为 `WeatherState(WeatherType.OVERCAST, 1)`（阴天，剩余 1 tick，再推进一次将彻底过期）。
+   - 调用一次 `processTick()`。
+   - **断言 1**：当前天气已不再是 `WeatherType.OVERCAST`，证明异色换庄生效，没有同色连庄。
+   - **断言 2**：新生成的 `ticksRemaining` 剩余时长落入 `[8, 16]` tick 区间内，无溢出。
+3. **高频 processTick 自然老化测试**：
+   - 将天气设为持续 10  ticks，连续调用 100 次 `processTick()` 模拟长久岁月。
+   - **断言**：系统全程稳定运行，经历了多次天气安全换庄，没有任何 NullPointerException，所有时长均为正整数。
+
+### 交付物：
+只包含 `processTick` 核心状态推演、原子 CAS 更新、异色天候池洗牌摇点算法、以及时序老化和换庄的 JUnit 单元测试。不含任何 Flow 全局广播和管理员强制覆盖机制。

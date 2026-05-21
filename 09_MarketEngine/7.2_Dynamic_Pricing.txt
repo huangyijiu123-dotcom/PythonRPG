@@ -1,0 +1,77 @@
+# MDU 7.2: 供需饱和度动态价格公式与信誉复苏系统 (MDU-B: Dynamic Pricing & Reputation)
+
+作为 AI 经济学工程师，你的任务是为 `MarketEngine` 植入符合古典经济学的“动态物价价格模型”及城邦“玩家信用等级评级复苏”引擎。
+
+---
+
+## 1. 核心价格与信誉计算契约 (Interface Contract)
+
+在 `MarketEngine` 中实现以下实时查价与玩家信誉管理接口（确保高并发原子安全性）：
+
+```kotlin
+// 实时获取城邦当前对某物资的实时价格信息
+// 供 UI 展示和玩家脚本策略查阅
+fun getPriceInfo(cityId: Long, item: String): PriceInfo?
+
+// 信誉自然恢复（外部在每日结算时主动调用一次）
+fun processReputationRecovery(cityId: Long)
+
+// 快速修复信誉（玩家向城邦递交紧急急缺物资任务时调用）
+fun boostReputation(cityId: Long, amount: Float)
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **禁止供给饱和度越界 (Clamp Supply Rate)**：
+   计算公式中的供给饱和度 $\text{supplyRate}$ 必须严格限制在 `[0.0f, 1.0f]` 区间。即使由于某些异常导致当前库存量大于 `maxCapacity`，其供给饱和度计算也必须经过 `coerceIn(0.0f, 1.0f)` 限制，防止算出的物价变成负数。
+2. **禁止除以零异常**：`maxCapacity` 必须 `coerceAtLeast(1)` 作为除数。
+
+### 机械式步骤指令：
+1. **实时计算价格公式 (`getPriceInfo`)**：
+   - 步骤 A：从 `cityStates` 中定位城邦。若不存在，直接返回 `null`。
+   - 步骤 B：读取该物资的基准价格 $P_{base}$（若基准价格字典中未配置该 Key，返回 0.0f 或 null）与需求系数 $D_{coeff}$（无配置则默认设为 0.0f）。
+   - 步骤 C：读取当前库存量 $Inv_{current}$。计算供给饱和度：
+     $$\text{supplyRate} = \frac{Inv_{current}}{maxCapacity} \text{（用 coerceIn(0.0f, 1.0f) 锁定范围）}$$
+   - 步骤 D：计算信誉修正系数 $R_{mult}$（信誉值 $Rep$ 范围在 $-0.5 \sim 1.0$ 之间）：
+     - 若 $Rep \ge 0.5$：系数为 `1.0f`。
+     - 若 $0 \le Rep < 0.5$：系数为 `1.0f`。
+     - 若 $-0.3 \le Rep < 0$：系数为 `0.9f`（对玩家不利，卖价压低 10%）。
+     - 若 $Rep < -0.3$：触发城邦惩罚挂起挂牌（`isSuspended = true`），系数返回 `0.9f`。
+   - 步骤 E：使用动态经济公式结算并返回 `PriceInfo`：
+     $$\text{当前价格} = P_{base} \times (1.0f + D_{coeff}) \times (1.0f - \text{supplyRate}) \times R_{mult}$$
+2. **实现信誉恢复 (`processReputationRecovery`)**：
+   - 定位城邦。信誉如果没触顶（$< 1.0f$），自增 `0.02f` 并 `coerceAtMost(1.0f)` 截断。
+   - **自动解除封锁**：如果信誉经此增加后回升到 $\ge -0.3f$，且此前状态是 `isSuspended == true`，自动将其 `isSuspended` 状态解锁恢复为 `false`，以允许恢复交易。
+3. **实现金币补救 (`boostReputation`)**：
+   - 直接将 reputation 累加 `amount`，并用 `coerceIn(-0.5f, 1.0f)` 限幅。若新信誉 $\ge -0.3f$，自动重置 `isSuspended = false`。
+
+---
+
+## MDU 7.2-TEST: 动态物价模型与信誉自动解封黑盒测试
+
+编写单元测试 `MarketEnginePricingTest.kt`。
+
+### 机械式测试用例：
+1. **零饱和度时最高价校验测试**：
+   - 注册一个基准价格为 100.0f，需求系数为 0.5f，库存为 0 的城邦。信誉为 1.0。
+   - 调用 `getPriceInfo` 获取价格。
+   - **断言**：供给饱和度为 0，当前实时价格精准等于 $100.0 \times (1 + 0.5) \times (1 - 0) \times 1.0 = 150.0f$。
+2. **容量爆满零价格限幅测试**：
+   - 在上述城邦中，将该物资库存调为 `1000`（与 `maxCapacity` 完全一致，供给饱和度达 1.0）。
+   - 调用 `getPriceInfo`。
+   - **断言**：当前实时查价价格精准等于 `0.0f`，证明供需完全饱和，没有发生负值溢出。
+3. **信誉恶化压低卖价测试**：
+   - 设定城邦信誉值为 `-0.1f`。基准价格为 100.0f，无需求系数，库存为 0。
+   - 调用 `getPriceInfo`。
+   - **断言**：因触发信誉轻度惩罚，物价乘数采用 0.9f，当前价格返回 `90.0f`。
+4. **信誉自然恢复与挂起解锁测试**：
+   - 设定城邦信誉为 `-0.31f`，此时被强行封锁挂起（`isSuspended = true`）。
+   - 连续调用 2 次 `processReputationRecovery`（每次恢复 0.02f，累计恢复到 -0.27f）。
+   - **断言 1**：城邦的 `reputation` 精准等于 `-0.27f`。
+   - **断言 2**：`isSuspended` 状态已被自动复位解锁为 `false`，城邦重现生机。
+
+### 交付物：
+只包含 `getPriceInfo` 计算核心、两个信誉调节和自动状态重置方法实现、以及价格及信用解锁的 JUnit 测试。不含任何倾销判定与实际 buy/sell 结算流。

@@ -1,0 +1,86 @@
+# MDU 15.4: 折旧比例精算修理与高并发多工件压测 (MDU-D: Repairs & Concurrency)
+
+作为 AI 装备锻造强化专家，你的任务是开发高度公平、符合真实折旧率的铁匠铺“装备精打细算修理系统”，并对整个装备库在高负荷读写下的多线程“高并发零脏读抗压性能”做出断言防线。
+
+---
+
+## 1. 装备修理与并发性能契约 (Repair & Concurrency Contract)
+
+在铁匠铺中实现核心的折旧修理结算 API（确保在多线程读写下的状态自洽性）：
+
+```kotlin
+// 装备打磨维修：消耗一定比例的“铁矿石”原料，将装备的 durability 耐久恢复至 maxDurability 最大耐久值
+// 修理材料消耗公式： requiredIron = ceil( 基础制造铁矿造价 * (1 - cur/max) )
+// 返回值：true=修理完工，false=材料不足修理失败
+fun repairEquipment(equipmentId: Long): Boolean
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **耐久全满白嫖材料扣减红线 (No Deduction for Perfect Durability)**：
+   在调用 `repairEquipment` 时，**必须优先验证耐久度**！如果当前装备耐久全满（`durability == maxDurability`），代表无磨损，必须直接返回 `true`，**绝对禁止扣减任何铁矿石材料**，保护玩家的财务资产。
+2. **禁止非正规材料折损**：除铁矿石外，石材、木材、黑曜石在修理阶段严禁扣除，只按主导铁矿资源进行比例折现修理，简化结算。
+
+### 机械式步骤指令：
+1. **折旧修理费精算算法实现 (`repairEquipment`)**：
+   - 步骤 A：提取装备实体：`val eq = dependencyProvider.getEquipment(equipmentId) ?: return false`。
+   - 步骤 B：**无磨损免资验证**：
+     - 若 `eq.durability >= eq.maxDurability`，无需打磨修理，直接亮绿灯返回 `true`。
+   - 步骤 C：**精算铁矿消耗量**：
+     - 提取制造配方：`val recipe = templates[eq.templateId] ?: return false`。
+     - 计算磨损损耗率：
+       `val lossRate = 1.0 - (eq.durability.toDouble() / eq.maxDurability.toDouble())`
+     - 向上取整换算所需铁矿：
+       `val requiredIron = Math.ceil(recipe.ironCost.toDouble() * lossRate).toInt()`
+     - 锁死扣料字典：`val costs = mapOf("IRON_ORE" to Math.max(1, requiredIron))`（若有损耗，保底消耗 1 颗铁矿）。
+   - 步骤 D：**划扣修理与复活**：
+     - 调用依赖扣减：`val success = dependencyProvider.deductResources(costs)`。
+     - 若 `success` 为 `false`，代表铁矿材料不够，返回 `false`（修理失败）。
+     - 若划扣成功：
+       - 耐久满血复活：`eq.durability = eq.maxDurability`。
+       - 物理写回数据库：`dependencyProvider.updateEquipment(eq)`。
+       - 返回 `true`。
+
+---
+
+## MDU 15.4-TEST: 装备折旧率修理精算与多线程高频读写零死锁压测
+
+编写单元测试 `ForgeRepairAndConcurrencyTest.kt`。
+
+### 机械式测试用例：
+1. **磨损 50% 铁剑精算修理铁矿消耗测试**：
+   - Mock 数据库：存在一件 ID 为 `777L` 的铁剑（最大耐久 200，基础制造铁矿造价为 15 块），当前耐久被怪物砍得仅剩 `100`（损耗率正好为 50%）。
+   - 设定资源判定通过。
+   - 调用 `repairEquipment(777L)`。
+   - **断言 1**：精算修理费扣减铁矿总量精准等于 $\lceil 15 \times 0.5 \rceil = 8$ 块铁矿石（物理防白嫖计算起效）。
+   - **断言 2**：修理后，铁剑耐久满血恢复为 `200`，数据库物理更新接口成功写回。
+2. **耐久全满白嫖零材料损耗测试**：
+   - Mock 数据库存在一件耐久全满（`200/200`）的铁剑。
+   - 设定监听：任何扣除资源的调用如果被触发，则抛出异常。
+   - 调用 `repairEquipment(777L)`。
+   - **断言**：方法直接返回 `true`，未划扣任何材料，无损零开销退出。
+3. **极限多线程并发锻造、强化、拆解与修理零死锁压测**：
+   - 预先在数据库中注册 10 件初始装备。
+   - 启动 50 个高并发协程 Workers 并发轰炸：
+     - 10 个协程疯狂调用 `processTick()` 和 `queueForge` 进行铁工排产。
+     - 20 个协程疯狂调用 `upgradeEquipment` 和 `upgradeTo` 尝试强化拉满。
+     - 10 个协程疯狂调用 `repairEquipment` 折旧打磨修理。
+     - 10 个协程高频调用 `dismantleEquipment` 进行物理熔炉拆料。
+   - **断言**：运行 2000 轮交织读写，系统未发生任何 ConcurrentModificationException 脏读报错，字典状态完全自洽，未发生永久挂起死锁。
+
+---
+
+## 🔒 语义级冻结声明 (Semantic-Level Freeze Declaration)
+
+当本 MDU 及其配套测试完全通过后，`ForgeEngine` 核心语义冻结。
+
+### 冻结语义边界：
+1. **折旧修理精算**：修理核心材料仅扣除铁矿石（IRON_ORE），消耗量公式 `ceil(recipe.ironCost * lossRate)` 绝对保底为 1。
+2. **拆解退款向下取整**：旧装备熔炼拆解退料必须为 `floor(cost * 0.5)`，严禁任何形式的四舍五入。
+3. **强化降级极限**：+9 到 +10 失败降级 2 级，+4 到 +9 失败降级 1 级，0 级为最低物理保底限制。
+
+### 允许进化范围 (Permitted Evolutions)：
+- 允许后续增加全新的豪华装备模板（如“黄金战斧”或“钻石神铠”）并配置基础耐久及攻击防御，但这些豪华模板的锻造、拆解百分之五十折算、精炼摇点退级保护以及折旧率修理必须无条件遵循本模块的数值物理机制。

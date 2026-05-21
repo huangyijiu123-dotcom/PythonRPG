@@ -1,0 +1,89 @@
+# MDU 5.2: 村民自转状态机、天气法令影响与黄昏审查系统 (MDU-B: Villager Automation System)
+
+作为 AI 编码助手，你的任务是为《游戏说明书》中最复杂且高内聚的核心引擎——**村民自转自动化系统**（`VillagerAutomationSystem`）注入完整的状态驱动力，并妥善处理天气乘数、法令修正及黄昏夜晚的极端作息控制规则。
+
+---
+
+## 1. 核心状态机自转逻辑契约 (Rules of State Machine)
+
+实现 `VillagerAutomationSystem : ITickableSystem`。每次收到 `processTick` 时，读取当前全部村民快照，针对每一个村民执行如下原子更新与状态流转运算：
+
+### 状态 1: RESTING (在民房休息)
+- **行为**：持续恢复体力。
+- **计算公式**：每 Tick 体力增加 $E_{restore} = \text{energyRestorePerTick} \times \text{时段乘数}$。
+  - 白天时段时段乘数为 `1.0`。
+  - 夜晚（NIGHT）时段乘数为 `nightRestoreBonus`（默认为 2.0）。
+- **边界限制**：体力达到上限 `100` 后静默保持 100。除非收到外部工作派指，否则继续停留在 `RESTING` 状态。
+
+### 状态 2: MOVING (步进移动，前往工作点或仓库)
+- **行为**：向工作点或目标坐标前进。
+- **导航规则**：
+  - 调用 `PathfindingEngine.findPath`，将地图通行性传入 `PassabilityGrid`：
+    `PassabilityGrid.isPassable` 返回 `true` 的条件为：格子已被探索且格子上没有未清理的怪物（通过 `GridMapData.getTile` 校验 `exploreStatus == VISIBLE_UNEXPLORED` 或 `EXPLORED`，且 `hasMonster == false`）。
+  - 根据 `villagerMoveSpeed`（默认为 2 格/Tick），从路径中提取下 2 个坐标点作为步进，调用 `EntityStateManager.updateVillagerPosition` 逐格物理位移。
+  - **终点抵达**：如果到达了终点（工作点或仓库），若此前为 EQUIPPING 状态切换为换装交互，否则进入 `WORKING` 或 `DELIVERING` 的物理作业中。
+
+### 状态 3: WORKING (物理采集作业)
+- **体力消耗**：每次 WORKING，消耗体力值：
+  $$E_{cost} = \text{energyCostPerAction} \times \text{WeatherModifiers.energyCostMultiplier} \times \text{PolicyModifiers.energyCostMultiplier}$$
+- **体力虚弱判定**：
+  - 若当前体力 $\le 20$：产出效率腰斩（产出计算结果乘以 `0.5` 截断）。
+  - 若当前体力降为 $0$：强制将村民状态机变更为 `MOVING`（目标 cottageId 坐标），并向总线抛出 `VillagerReturningHome(villagerId, reason = "LOW_ENERGY")` 事件。
+- **产出量计算**：
+  $$\text{Amount} = \text{baseHarvestAmount} \times (1.0f + \text{工具耐久加成倍率}) \times \text{PolicyModifiers.harvestYieldMultiplier}$$
+  - 工具耐久加成从村民的 `equippedTools` 里检索。若装备了 `"STONE_AXE"` 或 `"IRON_AXE"` 等，则根据 `ActionConfig.toolEfficiencyBonus` 叠算。
+- **工具磨损与损坏**：每次产出，扣减当前所用工具的耐久度 1 点（调用 `entityState.updateToolDurability`）。一旦耐久度归零，工具物理移出。向总线抛出 `VillagerToolBroken` 事件。
+- **背包归宿**：将产出物调用 `updateVillagerBackpackItem` 塞入背包。若背包满了（总容量达到上限），立即强制变更为 `DELIVERING` 状态，目标点设为物理距离最近的可用仓库。
+
+### 状态 4: DELIVERING (交付资源)
+- **行为**：寻找物理距离最近的仓库（根据坐标 $d = \sqrt{(x_1-x_2)^2 + (y_1-y_2)^2}$ 计算最近的 LOCAL、DISTRIBUTION 或 ROYAL 仓库），调用寻路并以前往。
+- **仓库交付交互**：
+  - 到达仓库后，挂起调用 `transferItemVillagerToWarehouse` 转移背包所有物资。
+  - 若仓库爆满导致无法转移（fillRatio 达到限制），继续停留在 `DELIVERING` 状态原地等待，直到有空间（不切换状态）。
+  - **交付成功后**：若当前时段不是 `NIGHT` 且不是 `TWILIGHT`，状态重新切回 `MOVING`（返回原工作点）；如果是黄昏或夜晚，则切换 `MOVING`（返回民房）。
+
+### 状态 5: EQUIPPING (换装中)
+- **行为**：前往指定仓库换装工具，到达仓库后执行工具替换，随后继续切换为 `MOVING` 返回工作点。
+
+---
+
+## 3. 黄昏与夜晚夜晚强制检查规则 (Twilight & Night Enforcement)
+
+在 `processTick` 的所有村民状态流转处理完毕后，执行最终的时段强力拦截审阅：
+1. **黄昏强制规约**（`timeOfDay == TWILIGHT`）：
+   - `WORKING` 状态村民：背包里有资源则强制改为 `DELIVERING`（前往最近仓库），背包无资源则强制改为 `MOVING`（目标 cottageId 返回民房）。并抛出 `VillagerReturningHome(id, "TWILIGHT")`。
+   - `MOVING`（前往工作点）的村民：中途强制掉头，变更为 `MOVING`（目标 cottageId 返回民房）。
+2. **夜晚露宿惩罚**（`timeOfDay == NIGHT`）：
+   - 检索所有当前 X,Y 坐标与 `cottageId` 坐标不一致的在外流落村民。
+   - 在下一 Tick 开始时，若这些村民依然流落在外，体力恢复公式乘以 `overnightEnergyPenalty`（默认为 0.5，代表在外疲劳削减）。
+
+---
+
+## MDU 5.2-TEST: 村民自转状态机与时间控制黑盒测试
+
+编写单元测试 `VillagerAutomationSystemTest.kt`。
+
+### 机械式测试用例：
+1. **村民 WORKING 状态采集满载切换交付测试**：
+   - 初始化一个体力为 100 的 WORKING 村民，工作点设在 `(3, 3)`，背包容量已塞有 90 个木头，基础单次产量为 15，最大背包承载 100。
+   - 推进一次自转 Tick。
+   - **断言 1**：村民的 `status` 自动切为 `DELIVERING`（因产出后 105 超过 100 背包上限）。
+   - **断言 2**：村民的 `backpack` 正确增值，且状态切换，寻路目标指向了最近的可用仓库。
+2. **黄昏黄昏拦截强制掉头回家测试**：
+   - 设置当前时段为 `TWILIGHT`。
+   - 实例化一个正在前往工作点的 `MOVING` 状态村民，坐标 `(2, 2)`，工作点 `(10, 10)`，民房在 `(0, 0)`。
+   - 推进一次自转 Tick。
+   - **断言 1**：村民的 `status` 依然保持为 `MOVING`，但其内部目标已被强制改为 `(0, 0)`（大本营回家）。
+   - **断言 2**：向事件队列抛出了 `VillagerReturningHome` 事件，原因为 `"TWILIGHT"`。
+3. **工具归零损坏移除事件拦截测试**：
+   - 设定村民持有一把耐久度为 1 的 `"STONE_AXE"`，状态为 `WORKING`。
+   - 推进一次自转 Tick 触发采集结算。
+   - **断言 1**：村民的 `equippedTools` Map 中已完全没有 `"STONE_AXE"`。
+   - **断言 2**：在事件流中监听到了发出的 `VillagerToolBroken` 报警事件。
+4. **在外过夜在外露宿恢复惩罚测试**：
+   - 设定时段为 `NIGHT`，村民坐标为 `(5, 5)`（在外过夜），其 cottageId 民房坐标为 `(0, 0)`。
+   - 推进一次自转 Tick。
+   - **断言**：其体力恢复计算中，计算值被严格乘以了 `overnightEnergyPenalty`（0.5 倍恢复率）。
+
+### 交付物：
+只包含 `VillagerAutomationSystem` 自转状态机类实现、黄昏夜晚作息拦截规则、天气法令参数叠加、及对应村民自转极限用例的黑盒 JUnit 测试。不含任何高层指令处理器或跨系统移动。

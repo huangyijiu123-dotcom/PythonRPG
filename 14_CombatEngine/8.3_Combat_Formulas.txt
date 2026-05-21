@@ -1,0 +1,75 @@
+# MDU 8.3: 连击暴击概率公式与手动答题结算器 (MDU-C: Critical Combos & Manual Answers)
+
+作为 AI 游戏战斗系统设计专家，你的任务是精细落实玩家“手动答题”正误判定后的战损扣减、连击叠加、暴击概率浮动计算以及状态机死斗终结器。
+
+---
+
+## 1. 手动结算核心接口契约 (Interface Contract)
+
+在 `CombatEngine` 中声明并实现手动答题结算核心方法（确保伤害数值公式精度）：
+
+```kotlin
+// 手动提交玩家答题判定结果
+// isCorrect == true 代表答对，触发玩家连击暴击及怪物扣血
+// isCorrect == false 代表答错，触发连击清零及怪物的反击战损
+// 返回：AnswerResult 本次交互战况回执，若战斗终结，sessionEnded 设为 true 且向 SharedFlow 抛出事件
+fun submitAnswer(sessionId: Long, isCorrect: Boolean): AnswerResult
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **伤害负数穿透红线 (Non-Zero Damage 保底)**：
+   在计算伤害或反击伤害时，**必须设立 1 点物理保底**！无论是通过极其厚重的防御还是怪物的逆天身板，扣减生命值的公式结果必须使用 `coerceAtLeast(1)` 进行包裹（即至少强制扣 1 滴血），严禁出现无害或加血滑稽现象。
+2. **禁止提前修改持久状态**：冒险者生命值只扣减在会话的 `adventurerCurrentHp` 临时状态中，不准直接写入外部。
+
+### 机械式步骤指令：
+1. **执行答对分支处理 (`isCorrect == true`)**：
+   - 步骤 A：连击数滚雪球：`session.comboCount += 1`。连续超时次数归零：`session.consecutiveTimeoutCount = 0`。
+   - 步骤 B：**滑窗暴击率核算**：
+     - 若 $\text{comboCount} \le 2$：暴击几率 $C_{crit} = 0.0f$。
+     - 若 $\text{comboCount}$ 在 $3 \sim 4$ 之间：暴击几率 $C_{crit} = 0.3f$。
+     - 若 $\text{comboCount} \ge 5$：暴击几率 $C_{crit} = 0.7f$。
+   - 步骤 C：基础伤害核算（从 provider 获取实时全装攻击力 $Att_{adv}$）：
+     $$D_{base} = \max(1, Att_{adv} - \text{monster.defense})$$
+   - 步骤 D：暴击摇点：随机摇号 `Random.nextFloat() < C_crit`。若暴击：最终伤害 $D_{final} = (D_{base} \times 2.0f \times \text{session.damageMultiplier}).toInt()$，`isCritical = true`；若未暴击，最终伤害 $D_{final} = (D_{base} \times 1.0f \times \text{session.damageMultiplier}).toInt()$，`isCritical = false`。
+   - 步骤 E：扣减怪物生命值：`session.monsterCurrentHp = (session.monsterCurrentHp - D_{final}).coerceAtLeast(0)`。
+2. **执行答错分支处理 (`isCorrect == false`)**：
+   - 步骤 A：连击数熔断归零：`session.comboCount = 0`。连续超时次数归零：`session.consecutiveTimeoutCount = 0`。
+   - 步骤 B：**怪物反击伤害结算公式**（从 provider 获取全装防御 $Def_{adv}$）：
+     $$D_{taken} = \max(1.0f, \text{monster.strength} \times 0.3f - Def_{adv} \times 0.3f).toInt()$$
+   - 步骤 C：扣减冒险者生命值：`session.adventurerCurrentHp = (session.adventurerCurrentHp - D_{taken}).coerceAtLeast(0)`。
+3. **生死境界终结判定**：
+   - 若 `session.monsterCurrentHp <= 0`：调用 `endBattle(sessionId, BattleEndReason.MONSTER_DEFEATED)`，返回回执中 `sessionEnded = true`，结束原因 `"MONSTER_DEAD"`。
+   - 若 `session.adventurerCurrentHp <= 0`：调用 `endBattle(sessionId, BattleEndReason.ADVENTURER_INJURED)`，返回回执中 `sessionEnded = true`，结束原因 `"ADVENTURER_DEAD"`。
+   - 其余情况：`sessionEnded = false`，原因 `null`。
+
+---
+
+## MDU 8.3-TEST: 手动死斗答题战损与暴击分配黑盒测试
+
+编写单元测试 `CombatManualAnswerFormulaTest.kt`。
+
+### 机械式测试用例：
+1. **答对伤害保底与暴击倍率拦截测试**：
+   - 注册小怪，防御极高为 9999。玩家全装攻击力 10。
+   - 答对第 1 题（连击 = 1，暴击率 0%）。
+   - **断言 1**：伤害触发保底，精准为 `1`。
+   - 设法制造连击达到 5。再次答对一题。
+   - **断言 2**：连击达到 5 后的暴击率返回 `0.7f`。
+   - 多次摇点测试，若触发暴击（`isCritical == true`），断言伤害精准等于 $1 \times 2 = 2$ 保底。
+2. **答错反击保底与连击熔断重置测试**：
+   - 玩家防御力 9999，怪物力量 10。当前连击数为 4。
+   - 调用 `submitAnswer(sessionId, isCorrect = false)` 答错。
+   - **断言 1**：连击数 `comboCount` 精准被清算归零。
+   - **断言 2**：反击伤害计算虽然由于防御超高而衰减，但因 **1点非零保底** 物理红线，玩家依然被扣除了 `1` 点生命值。
+3. **濒死战局终结广播测试**：
+   - 设定小怪剩余 HP = 2。玩家对其造成 5 伤害。
+   - 调用答对。
+   - **断言 1**：`AnswerResult.sessionEnded` 返回 `true`。
+   - **断言 2**：`endReason` 为 `"MONSTER_DEAD"`，且活跃战斗会话从内存中消失。
+
+### 交付物：
+只包含 `submitAnswer` 计算结算引擎核心、保底战损判定、连击暴击判定实现、及对应正误战损的 JUnit 单元测试。不含超时自动逃跑、flee主动撤退及自动战斗 process 结算。

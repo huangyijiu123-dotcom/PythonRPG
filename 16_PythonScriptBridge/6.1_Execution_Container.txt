@@ -1,0 +1,111 @@
+# MDU 6.1: 基础沙箱执行容器与 AST 强安全拦截引擎 (MDU-A: Execution Container & AST Limiter)
+
+作为 AI 语言与沙箱安全专家，你的任务是为 Python 策略脚本建立绝对隔离的 Chaquopy 容器运行环境，并编写能够防范恶意入侵、死循环和爆栈的 **AST 静态检查器**。
+
+---
+
+## 1. 核心数据与接口契约 (Interface Contract)
+
+在桥接器中定义脚本执行的输出结构、沙箱限制及 Kotlin 侧核心挂起执行函数：
+
+```kotlin
+// 脚本执行结果返回数据类
+data class ScriptResult(
+    val success: Boolean,               // 是否编译并成功运行无崩溃
+    val stdout: String,                 // 拦截重定向的 print() 标准输出内容
+    val commandsEnqueued: Int,          // 成功在此 Tick 产生并排队的 PlayerCommand 数量
+    val errorMessage: String?,          // 游戏化或编译期的错误提示文本
+    val errorType: String?              // "AST_VIOLATION" | "RUNTIME_ERROR" | "TIMEOUT" | null
+)
+
+// 安全沙箱桥接器核心方法
+// 挂起函数，由协程驱动以防复杂计算假死主线程
+suspend fun executeScript(pythonCode: String): ScriptResult
+```
+
+### 🔒 内置 Builtins 安全白名单
+Python 容器的 `__builtins__` 强制替换为受限子集：
+`print, len, range, int, float, str, bool, list, dict, tuple, set, min, max, sum, abs, round, sorted, enumerate, zip, type, isinstance, getattr`
+预载数学模块：`math.ceil, math.floor, math.sqrt`
+**绝对封杀**：`os, sys, subprocess, shutil, socket, threading` 及其衍生包。
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **绝对禁止先执行代码后检查红线**：
+   **绝对禁止**将未经过 AST 拦截的代码放入 Chaquopy 引擎执行！哪怕是 `compile()` 都会产生编译期隐患，必须首先完成 AST 语法树结构解剖校验。
+2. **禁止裸 Except 结构逃逸**：
+   AST 必须封杀 `except:` 或 `except BaseException:`，防止玩家代码强行吞掉沙箱的底层超时中断信号。
+
+### 机械式步骤指令：
+1. **编写嵌入式 Python AST 静态拦截脚本**：
+   在 Bridge 内部定义一段随编译加载的辅助 Python AST 检查函数（可在 Python 解释器内作为 `ast_verify(code_str)` 调用）：
+   ```python
+   import ast
+   
+   def verify_script(code: str):
+       try:
+           tree = ast.parse(code)
+       except SyntaxError as e:
+           return {"ok": False, "type": "SYNTAX_ERROR", "msg": str(e)}
+           
+       node_count = 0
+       for node in ast.walk(tree):
+           node_count += 1
+           if node_count > 500:
+               return {"ok": False, "type": "AST_VIOLATION", "msg": "脚本过于冗长，AST 节点超过 500"}
+               
+           # 1. 禁用任何 import 语句
+           if isinstance(node, (ast.Import, ast.ImportFrom)):
+               return {"ok": False, "type": "AST_VIOLATION", "msg": "禁止在脚本中使用 import 导入模块！"}
+               
+           # 2. 禁用危险调用
+           if isinstance(node, ast.Call):
+               if isinstance(node.func, ast.Name) and node.func.id in ['eval', 'exec', 'compile', 'open', '__import__']:
+                   return {"ok": False, "type": "AST_VIOLATION", "msg": f"禁忌调用：{node.func.id}"}
+                   
+           # 3. 封杀裸 except:
+           if isinstance(node, ast.ExceptHandler) and node.type is None:
+               return {"ok": False, "type": "AST_VIOLATION", "msg": "禁止使用裸 except 吞噬异常"}
+               
+           # 4. 封杀 while True 死循环
+           if isinstance(node, ast.While):
+               # 若 while 条件是常数 True，且闭包内无 Break 结构，直接秒拦截
+               if isinstance(node.test, ast.Constant) and node.test.value is True:
+                   has_break = any(isinstance(n, ast.Break) for n in ast.walk(node))
+                   if not has_break:
+                       return {"ok": False, "type": "AST_VIOLATION", "msg": "检测到死循环 while True"}
+                       
+       return {"ok": True}
+   ```
+2. **实现 Kotlin 沙箱调用逻辑**：
+   - 步骤 A：获取 Chaquopy 解释器实例，执行 `verify_script(pythonCode)`。若返回 `verify["ok"] == false`，直接组装 `ScriptResult(false, "", 0, verify["msg"], verify["type"])` 快速秒退。
+   - 步骤 B：**重定向输出**。注入重定向 stdout 脚本（如 `sys.stdout = io.StringIO()`），在执行完后读取缓冲区获取 stdout 并重置还原。
+   - 步骤 C：使用 `withTimeoutOrNull(2000)` 协程包裹 Chaquopy 的 `exec` 主执行体。如果超出 2 秒，直接取消协程，抛出 `TIMEOUT` 错误，保障游戏主线程物理安全。
+
+---
+
+## MDU 6.1-TEST: AST 静态拦截与容器沙箱黑盒测试
+
+编写单元测试 `PythonScriptBridgeASTTest.kt`。
+
+### 机械式测试用例：
+1. **Import 违禁语法拒绝测试**：
+   - 投递代码 `"import os\nos.system('rm -rf /')"`。
+   - **断言 1**：`ScriptResult.success` 严格为 `false`。
+   - **断言 2**：`errorType` 为 `"AST_VIOLATION"`，且代码从未被投入实际执行容器。
+2. **裸 Except 与死循环死锁防御测试**：
+   - 投递死循环死锁代码 `"while True: pass"`。
+   - **断言**：被 AST 拦截，判定为死循环风险，返回 `AST_VIOLATION`。
+   - 投递代码 `"try:\n  a = 1\nexcept:\n  pass"`。
+   - **断言**：被判定含有裸 except，返回 `AST_VIOLATION` 拒绝运行。
+3. **Chaquopy 超时协程熔断测试**：
+   - 构造一段难以通过 AST 简单查出但运行需要几分钟的合法脚本（如高强度的斐波那契递归运算）。
+   - 调用 `executeScript` 并启动计时。
+   - **断言 1**：在协程熔断保护下，方法在 2.5 秒内必定强制返回。
+   - **断言 2**：返回结果的 `errorType` 严格为 `"TIMEOUT"`，且主线程从未假死。
+
+### 交付物：
+只包含基础 `ScriptResult` 结构、`executeScript` 骨架定义、嵌入式 Python AST 静态校验逻辑、协程挂起超时管理及对应边界测试。不含任何只读代理或全局 Context 对象的注入。

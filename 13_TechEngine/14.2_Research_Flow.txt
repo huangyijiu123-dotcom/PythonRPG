@@ -1,0 +1,85 @@
+# MDU 14.2: 研究启动审查与暂存资源质押/释放机制 (MDU-B: Pledge & Cancel)
+
+作为 AI 科技树管理专家，你的任务是为科技引擎研发严格的“科研前置条件拦截器”以及用于开始/放弃研究的“物资原子质押/原路退回状态流转机”。
+
+---
+
+## 1. 资源质押与科研流程契约 (Pledge & Cancel Contract)
+
+在科技树管理引擎外层声明依赖注入的回调接口，并实现核心的放置与升级拦截 API（保障资源划扣的高度原子安全性）：
+
+```kotlin
+// 科技外部资源和全局通知回调接口
+interface TechDependencyProvider {
+    // 从玩家仓库冻结/扣除对应的研发物料（质押暂存，若资源不足返回 false）
+    fun tryPledgeResources(resources: Map<String, Int>): Boolean
+
+    // 考核最终通过时，将之前已暂存质押的物资彻底抹去扣除
+    fun consumePledgedResources(resources: Map<String, Int>)
+
+    // 玩家取消研究、或放弃任务时，将之前暂存质押的物资原封不动归还至大仓库
+    fun refundPledgedResources(resources: Map<String, Int>)
+
+    // 某项科技正式解锁完工时触发全局通告，让其他系统（如村民管理/建筑系统）刷新上限
+    fun onTechUnlockedGlobalEvent(techId: String)
+}
+
+// 尝试对指定科技启动研究（包含前置依赖检查及资源质押划扣）
+// 返回：是否顺利进入 RESEARCHING 状态
+fun startResearch(techId: String): Boolean
+
+// 放弃当前处于考核中的研究项目（释放已被冻结质押的原材料）
+fun cancelResearch(techId: String)
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **科研非法越轨红线 (No Out-of-Order Research)**：
+   在调用 `startResearch` 时，**必须严格强制校对当前状态**！只有当前状态精准为 `TechState.AVAILABLE` 才可以放行！如果为 `LOCKED`（条件不满足）、`RESEARCHING`（已在研）或 `UNLOCKED`（已解锁），必须立即返回 `false` 拦截，杜绝“无视前置直接跃进”的逻辑 Bug。
+2. **禁止静默流失与死锁**：放弃研究调用 `cancelResearch` 后必须立刻归还质押资源，不残存溢出。
+
+### 机械式步骤指令：
+1. **实现研发开始与安全资源质押 (`startResearch`)**：
+   - 步骤 A：获取节点：`val node = nodes[techId] ?: return false`（若无此科技，拦截返回 false）。
+   - 步骤 B：**前置可用性状态校验**：
+     - 若 `node.state != TechState.AVAILABLE`，强力返回 `false`（防跨级研发、防重复研发）。
+   - 步骤 C：**原子资源质押暂存**：
+     - 调用依赖：`val pledged = dependencyProvider.tryPledgeResources(node.cost)`。
+     - 若 `pledged` 为 `false`，代表玩家大仓库付不起材料，强力返回 `false`（缺料拦截）。
+     - 若成功扣减质押，线程安全将状态修改为：
+       `node.state = TechState.RESEARCHING`
+     - 顺利返回 `true`。
+2. **实现放弃研究与资源解冻归还 (`cancelResearch`)**：
+   - 步骤 A：获取节点：`val node = nodes[techId] ?: return`。
+   - 步骤 B：**状态严格准入校验**：
+     - 若 `node.state != TechState.RESEARCHING`，直接无害退出（只有在研且已质押材料的科技允许撤销）。
+   - 步骤 C：**解冻流转**：
+     - 修改节点状态，回滚恢复为可用：
+       `node.state = TechState.AVAILABLE`
+     - **资源原路全额返还**：调用依赖：`dependencyProvider.refundPledgedResources(node.cost)`。
+
+---
+
+## MDU 14.2-TEST: 未解前置拦截与放弃研究材料返还测试
+
+编写单元测试 `TechPledgeAndCancelTest.kt`。
+
+### 机械式测试用例：
+1. **前置锁定科技非法越级研发拦截测试**：
+   - 工房 ID `"WHEELBARROW"` (小推车) 的前置为 `"BACKPACK_WEAVING"`，初始状态为 `LOCKED`。
+   - 尝试调用 `startResearch("WHEELBARROW")`。
+   - **断言**：方法强力拦截并返回 `false`，状态依旧为 `LOCKED`，越级拦截成功。
+2. **放弃研究返还质押材料核销测试**：
+   - Mock 环境：免科技的前置已开通。质押资源回调返回 `true`（质押成功）。
+   - 对 `"BACKPACK_WEAVING"` (木材 50) 调用 `startResearch` 开启研发。
+   - **断言 1**：方法返回 `true`，其状态修改为 `TechState.RESEARCHING`。
+   - 设定返还监听回调：捕获释放质押资源事件。
+   - 调用 `cancelResearch("BACKPACK_WEAVING")` 强行撤单。
+   - **断言 2**：状态即刻回滚变回 `TechState.AVAILABLE`。
+   - **断言 3**：释放质押物资接口被成功触发，且返还材料精准包含 `"木材" to 50`，资金无损解冻。
+
+### 交付物：
+只包含 `startResearch` 合法校验质押、`cancelResearch` 返还方法实现、以及前置依赖阻断和解冻返还的 JUnit 单元测试代码。不含任何沙盒考核通过、消耗质押及科技解封链条传导逻辑。

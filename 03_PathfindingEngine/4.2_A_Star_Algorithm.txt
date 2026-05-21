@@ -1,0 +1,318 @@
+# MDU 4.2: A* 核心寻路算法与搜索步数限值拦截
+
+## 任务目标
+
+为 `PathfindingEngine` 实现标准 A* 网格寻路核心主循环，融入搜索步数强力熔断截断机制，并进行核心边界黑盒测试。
+
+**输出标准**：仅允许四方向正交步进；禁止分配 Coordinate 对象；禁止协程；maxSteps 熔断必须生效。
+
+---
+
+## 1. 核心寻路接口契约（不可更改方法签名）
+
+### 1.1 findPath 方法
+
+```kotlin
+// 核心 A* 寻路方法
+// fromX, fromY：起点坐标
+// toX, toY：终点坐标
+// grid：地图地形通行快照接口
+// maxSteps：最大探索步数熔断上限（防止目标不可达时全图挂起扫描，造成卡顿死锁）
+// 返回值：PathResult（包含寻路状态、路径列表、移动步数及未通过原因说明）
+fun findPath(
+    fromX: Int, fromY: Int,
+    toX: Int, toY: Int,
+    grid: PassabilityGrid,
+    maxSteps: Int = 500
+): PathResult
+```
+
+---
+
+## 2. 机械式步骤指令
+
+### 2.1 前置拦截（边界短路）
+
+```kotlin
+// 1. 起点等于终点
+if (fromX == toX && fromY == toY) {
+    return PathResult(
+        found = true,
+        path = listOf(Coordinate(fromX, fromY)),
+        totalSteps = 0,
+        reason = "START_EQUALS_END"
+    )
+}
+
+// 2. 起点不可通行
+if (!grid.isPassable(fromX, fromY)) {
+    return PathResult(
+        found = false,
+        path = emptyList(),
+        totalSteps = 0,
+        reason = "START_NOT_PASSABLE"
+    )
+}
+
+// 3. 终点不可通行
+if (!grid.isPassable(toX, toY)) {
+    return PathResult(
+        found = false,
+        path = emptyList(),
+        totalSteps = 0,
+        reason = "DEST_NOT_PASSABLE"
+    )
+}
+```
+
+### 2.2 初始化寻路容器
+
+```kotlin
+// 优先队列
+val openSet = PriorityQueue<Node>(nodeComparator)
+
+// 已关闭集合（Long 压缩 Key，零对象分配）
+val closedSet = HashSet<Long>()
+
+// 坐标压缩函数
+fun pack(x: Int, y: Int): Long {
+    return (x.toLong() shl 32) or (y.toLong() and 0xFFFFFFFFL)
+}
+
+// 初始启发式代价（曼哈顿距离）
+val initH = kotlin.math.abs(fromX - toX) + kotlin.math.abs(fromY - toY)
+
+// 起点 Node
+val startNode = Node(fromX, fromY, 0, initH, null)
+openSet.offer(startNode)
+```
+
+### 2.3 A* 主循环展开
+
+```kotlin
+var stepsCount = 0
+
+while (openSet.isNotEmpty()) {
+    // 步数熔断检查
+    stepsCount++
+    if (stepsCount > maxSteps) {
+        return PathResult(
+            found = false,
+            path = emptyList(),
+            totalSteps = stepsCount,
+            reason = "STEP_LIMIT_EXCEEDED"
+        )
+    }
+    
+    // 弹出当前最优节点
+    val current = openSet.poll()
+    val currentKey = pack(current.x, current.y)
+    
+    // 已在 closedSet 中则跳过
+    if (closedSet.contains(currentKey)) {
+        continue
+    }
+    closedSet.add(currentKey)
+    
+    // 抵达终点判定
+    if (current.x == toX && current.y == toY) {
+        // 回溯重建路径
+        val pathList = mutableListOf<Coordinate>()
+        var currNode: Node? = current
+        while (currNode != null) {
+            pathList.add(Coordinate(currNode.x, currNode.y))
+            currNode = currNode.parent
+        }
+        pathList.reverse()
+        
+        return PathResult(
+            found = true,
+            path = pathList,
+            totalSteps = pathList.size - 1,
+            reason = "PATH_FOUND"
+        )
+    }
+    
+    // 扩展子节点（四方向正交步进）
+    val directions = listOf(
+        Pair(0, 1), Pair(0, -1),
+        Pair(1, 0), Pair(-1, 0)
+    )
+    
+    for ((dx, dy) in directions) {
+        val nx = current.x + dx
+        val ny = current.y + dy
+        
+        // 通行度校验
+        if (!grid.isPassable(nx, ny)) {
+            continue
+        }
+        
+        // closedSet 校验
+        val neighborKey = pack(nx, ny)
+        if (closedSet.contains(neighborKey)) {
+            continue
+        }
+        
+        // 构造子节点
+        val newG = current.g + 1
+        val h = kotlin.math.abs(nx - toX) + kotlin.math.abs(ny - toY)
+        val neighborNode = Node(nx, ny, newG, h, current)
+        openSet.offer(neighborNode)
+    }
+}
+
+// 循环结束仍未找到路径
+return PathResult(
+    found = false,
+    path = emptyList(),
+    totalSteps = stepsCount,
+    reason = "NO_PATH"
+)
+```
+
+---
+
+## 3. 禁止事项（硬性约束）
+
+1. **对角线寻路红线**：寻路仅允许上下左右**四方向正交步进**，严禁计算对角线。
+
+2. **禁止在主循环中分配多余的坐标对象**：为达到极致性能，除回溯最终路径外，算法探索过程中的 Node 重复校验必须直接使用 Long 压缩 Key，绝对禁止对每个遍历点单独 new `Coordinate` 对象，防范 GC 炸弹。
+
+3. **禁止协程与异步**：本算法是极高频被调用的纯同步纯计算方法，绝对禁止引入协程调度或并发异步逻辑。
+
+---
+
+## 4. 测试规范：PathfindingEngineCoreTest.kt
+
+### 4.1 测试原则
+
+⚠️ 黑盒测试强制规则：仅通过 `findPath` 公开接口验证行为，禁止越过接口检测 A* 内部优先队列状态。
+
+### 4.2 测试用例
+
+**T01：起点等于终点短路拦截测试**
+
+- 目的：验证起点=终点时立即短路返回
+- 步骤：
+  1. 实例化 `PathfindingEngine`
+  2. 对任何地图，调用 `findPath(3, 3, 3, 3, grid)`
+- 断言：
+  - `PathResult.found` == true
+  - `totalSteps` == 0
+  - `reason` == "START_EQUALS_END"
+- 通过标准：短路生效
+
+**T02：空旷网格标准最短路径测试**
+
+- 目的：验证无障碍时找到最短路径
+- 步骤：
+  1. 构建一个 5×5 的无阻通行地图 `PassabilityGrid`（所有 `isPassable` 均返回 `true`）
+  2. 寻路起点 `(0, 0)` 到终点 `(4, 4)`
+- 断言：
+  - `found` == true
+  - `totalSteps` == 8（正交曼哈顿距离最小步数：|0-4| + |0-4| = 8）
+  - 路径正确覆盖起点与终点
+- 通过标准：最短路径精确
+
+**T03：被困孤岛（无路可通）拦截测试**
+
+- 目的：验证完全封锁时返回 NO_PATH 且不卡死
+- 步骤：
+  1. 构建一个 3×3 的地图，起点为 `(1, 1)`
+  2. 终点设在 `(0, 0)` 且被一圈不可通行的格子（障碍墙）死死封锁
+  3. 执行寻路
+- 断言：
+  - `found` == false
+  - `reason` == "NO_PATH"
+  - 不发生卡死
+- 通过标准：无路判定正确
+
+**T04：搜索步数溢出限值熔断测试**
+
+- 目的：验证 maxSteps 熔断机制生效
+- 步骤：
+  1. 构建一个 10×10 的无阻通畅地图
+  2. 寻路起点 `(0, 0)` 到终点 `(8, 8)`（曼哈顿跨度为 16）
+  3. 限制最大步数 `maxSteps = 5`（超负荷熔断）
+  4. 执行寻路
+- 断言：
+  - `found` == false
+  - `reason` == "STEP_LIMIT_EXCEEDED"
+  - 耗时接近 0ms（熔断未遍历全图）
+- 通过标准：熔断生效
+
+---
+
+## 5. 测试框架要求
+
+- 使用 kotlin.test 断言库
+- 每个测试方法独立，无执行顺序依赖
+- 禁止使用反射访问私有字段
+- PassabilityGrid 可用匿名对象或测试实现模拟
+
+---
+
+## 6. 输出要求
+
+1. 仅输出 Kotlin 代码文件（PathfindingEngine.kt + PathfindingEngineCoreTest.kt）
+2. 包含：findPath 完整实现、pack 函数、四方向展开、熔断机制、路径回溯
+3. 不包含：路径平滑、双向 A*、性能压力测试
+4. 代码格式：遵循 Kotlin 官方约定
+
+---
+
+## 7. 模块边界说明
+
+**MDU 4.1（已完成）**：基础结构、测距函数、Node 定义
+**MDU 4.2（本章）**：A* 核心寻路、步数熔断
+**MDU 4.3（后续）**：路径平滑与优化
+**MDU 4.4（后续）**：双向 A* 或高级变体
+**MDU 4.5（后续）**：语义冻结
+
+---
+
+## 8. 快速行为查阅
+
+**前置拦截**：
+```
+findPath(3, 3, 3, 3, grid)
+  → fromX == toX && fromY == toY
+  → 短路返回 PathResult(found=true, totalSteps=0, reason="START_EQUALS_END")
+
+findPath(0, 0, 4, 4, grid) 且 grid.isPassable(0, 0) == false
+  → 返回 PathResult(found=false, reason="START_NOT_PASSABLE")
+
+findPath(0, 0, 4, 4, grid) 且 grid.isPassable(4, 4) == false
+  → 返回 PathResult(found=false, reason="DEST_NOT_PASSABLE")
+```
+
+**A* 主循环**：
+```
+findPath(0, 0, 4, 4, openGrid, maxSteps=500)
+  → openSet.add(Node(0, 0, g=0, h=8, parent=null))
+  → while (openSet.isNotEmpty())
+  →   stepsCount++；若 > 500 → 返回 STEP_LIMIT_EXCEEDED
+  →   current = openSet.poll()
+  →   pack(current.x, current.y) → closedSet 去重
+  →   若 current.x == toX && current.y == toY → 回溯路径
+  →   四方向展开邻居 → 通行度校验 → closedSet 校验 → openSet.offer()
+  → 循环结束 → 返回 NO_PATH
+```
+
+**路径回溯**：
+```
+找到终点 Node(x=4, y=4, g=8, parent=...)
+  → pathList = []
+  → while (currNode != null) { pathList.add(...); currNode = currNode.parent; }
+  → pathList.reverse()
+  → 返回 PathResult(found=true, path=pathList, totalSteps=pathList.size-1)
+```
+
+**熔断机制**：
+```
+findPath(0, 0, 8, 8, openGrid, maxSteps=5)
+  → stepsCount = 1, 2, 3, 4, 5
+  → stepsCount++ → 6 > 5 → 熔断
+  → 返回 PathResult(found=false, reason="STEP_LIMIT_EXCEEDED")
+```

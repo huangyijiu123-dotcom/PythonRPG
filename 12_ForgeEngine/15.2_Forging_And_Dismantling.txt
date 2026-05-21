@@ -1,0 +1,112 @@
+# MDU 15.2: 铁匠铺装备锻造排队推进与高低拆解 (MDU-B: Forging & Dismantling)
+
+作为 AI 装备锻造强化专家，你的任务是处理铁匠铺装备生产的排单扣料拦截、按 Tick 心跳滚动计时，以及旧装备熔炼拆解按比例退料的业务管线。
+
+---
+
+## 1. 制造生产与熔炼拆解契约 (Forging & Dismantle Contract)
+
+在外部声明数据库级联接口，并实现核心的放置与熔炼拆解 API（保障出厂设备及物资退还的原子安全性）：
+
+```kotlin
+// 铁匠铺外部数据库与仓库管理回调接口
+interface ForgeDependencyProvider {
+    // 从仓库划扣相应的锻造/强化原料（原料足额扣减返回 true，不足返回 false）
+    fun deductResources(resources: Map<String, Int>): Boolean
+
+    // 装备拆解或失败归还时，将原材料物理加回至主物资库
+    fun addResourcesToWarehouse(resources: Map<String, Int>)
+
+    // 制造完工出厂的一瞬间，将新装备以快照形式上架到玩家装备库
+    fun addEquipmentToWarehouse(equipment: EquipmentSnapshot)
+
+    // 从全局数据库中精准提取某件装备的实时属性快照
+    fun getEquipment(equipmentId: Long): EquipmentSnapshot?
+
+    // 强化/修理完工后，物理重写更新数据库中的装备镜像
+    fun updateEquipment(equipment: EquipmentSnapshot)
+
+    // 装备遭到物理熔炼拆解时，彻底从全局数据库中注销擦除该装备
+    fun removeEquipment(equipmentId: Long)
+}
+
+// 将指定装备模板放入铁匠铺生产排单队列（扣料成功返回 true，缺料返回 false）
+fun queueForge(templateId: String): Boolean
+
+// 外部统一驱动的心跳推进器，每一 Tick 推进排单队列
+fun processTick()
+
+// 将指定装备送入熔炉物理拆解（返还 50% 制造基础材料，并注销该装备）
+fun dismantleEquipment(equipmentId: Long)
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **单槽位多发并发红线 (Single Smithy Slot Redline)**：
+   在推进 processTick 时，**每 Tick 有且仅能对 `activeTasks` 中的最前排的第一个任务进行进度推进**！其余排队任务必须静止挂起，捍卫工坊工艺的严谨感与升级上限。
+2. **拆解百分之五十退料四舍五入红线 (Floor Division Penalty)**：
+   熔炉熔断退回的原料数量必须向下取整，即：
+   $$\text{退还数量} = \lfloor \text{基础材料造价} \times 0.5 \rfloor$$
+   *若基础需要 15 个铁矿，拆解必须精准退还 7 个，不允许四舍五入退还 8 个造成材料通胀漏失！*
+
+### 机械式步骤指令：
+1. **实现装备制造安全排单扣料 (`queueForge`)**：
+   - 步骤 A：模板判定：获取配方 `val recipe = templates[templateId] ?: return false`。
+   - 步骤 B：**制造材料安全扣减**：
+     - 装配造价字典：`val costs = mapOf("WOOD" to recipe.woodCost, "STONE" to recipe.stoneCost, "IRON_ORE" to recipe.ironCost, "GOLD" to recipe.goldCost, "OBSIDIAN" to recipe.obsidianCost)`。
+     - 调用扣料：`val success = dependencyProvider.deductResources(costs)`。
+     - 若 `success` 为 `false`，强力返回 `false`（支付原材料失败，拦截）。
+   - 步骤 C：**录入队列**：
+     - 申请任务自增 ID：`val taskId = taskIdGenerator.getAndIncrement()`。
+     - 构造新建任务快照：`val task = ForgeTask(taskId, templateId, currentProgress = 0, requiredTicks = recipe.requiredTicks)`。
+     - 追加到 `activeTasks` 列表中，返回 `true`。
+2. **实现心跳制造推进与出厂交付 (`processTick`)**：
+   - 步骤 A：安全检测：若 `activeTasks.isEmpty()`，直接安全退出。
+   - 步骤 B：**槽位限幅单工推进**：
+     - 仅提取最前排任务：`val task = activeTasks.first()`。
+     - 进度增加：`task.currentProgress += 1`。
+     - **大功告成出厂上架**：
+       - 若 `task.currentProgress >= task.requiredTicks`：
+         - 提取配方：`val recipe = templates[task.equipmentTemplateId] ?: return`。
+         - 生成自增全局装备 ID：`val eqId = equipmentIdGenerator.getAndIncrement()`。
+         - 构造崭新装备实体：`val eq = EquipmentSnapshot(eqId, task.equipmentTemplateId, recipe.equipmentClass, level = 0, baseStat = recipe.baseStat, currentStat = recipe.baseStat, durability = recipe.maxDurability, maxDurability = recipe.maxDurability, ownerId = null)`。
+         - **物理交货**：调用依赖上架：`dependencyProvider.addEquipmentToWarehouse(eq)`。
+         - **移出队列**：物理剔除最前方任务。
+3. **实现熔炉拆解折料与注销 (`dismantleEquipment`)**：
+   - 步骤 A：提取对象：`val eq = dependencyProvider.getEquipment(equipmentId) ?: return`（防护空对象）。
+   - 步骤 B：**精细退料计算**：
+     - 提取配方：`val recipe = templates[eq.templateId] ?: return`。
+     - 退料公式（向下取整）：
+       `val refunds = mutableMapOf<String, Int>()`
+       `if (recipe.woodCost > 0) refunds["WOOD"] = Math.floor(recipe.woodCost * 0.5).toInt()`
+       `if (recipe.stoneCost > 0) refunds["STONE"] = Math.floor(recipe.stoneCost * 0.5).toInt()`
+       `if (recipe.ironCost > 0) refunds["IRON_ORE"] = Math.floor(recipe.ironCost * 0.5).toInt()`
+       `if (recipe.goldCost > 0) refunds["GOLD"] = Math.floor(recipe.goldCost * 0.5).toInt()`
+       `if (recipe.obsidianCost > 0) refunds["OBSIDIAN"] = Math.floor(recipe.obsidianCost * 0.5).toInt()`
+     - **原材料加回仓库**：调用依赖：`dependencyProvider.addResourcesToWarehouse(refunds)`。
+   - 步骤 C：**物理注销**：调用依赖：`dependencyProvider.removeEquipment(equipmentId)`，将其抹除。
+
+---
+
+## MDU 15.2-TEST: 铁匠铺排单时序推进与熔炼拆解退料测试
+
+编写单元测试 `ForgeAndDismantleProcessTest.kt`。
+
+### 机械式测试用例：
+1. **排料扣料与单槽位时序推进出厂测试**：
+   - 设定配方扣料成功。排单生产一把铁剑 `"IRON_SWORD"`（耗时 5 Ticks）。
+   - **断言 1**：`queueForge` 扣料返回 `true`，且 `activeTasks` 中压入此石剑任务。
+   - 连续调用 5 次 `processTick()`。
+   - **断言 2**：在第 5 次心跳时，装备数据库中增加了一把 level 为 0、基础攻击为 20、满耐久 200 的新铁剑，且铁匠铺生产任务队列清空。
+2. **熔炉折旧拆解向下取整返料测试**：
+   - Mock 数据库：存在一个由 `"IRON_SWORD"` 制造出的出厂铁剑（ID 为 888L，大类 WEAPON，原造价铁矿 15）。
+   - 设定退还仓库监听器。
+   - 调用 `dismantleEquipment(888L)` 拆除。
+   - **断言 1**：物理删除接口 `removeEquipment(888L)` 顺利被触发。
+   - **断言 2**：退料资源加回精准等于 $\lfloor 15 \times 0.5 \rfloor = 7$ 个铁矿，木材 $\lfloor 10 \times 0.5 \rfloor = 5$ 个，绝对无四舍五入通胀。
+
+### 交付物：
+只包含 `queueForge` 扣料、`processTick` 时序滚动出厂、`dismantleEquipment` 拆解退料方法实现、以及排单出厂和物理向下取整退料的 JUnit 单元测试代码。不含精炼概率降级及装备折旧修理逻辑。

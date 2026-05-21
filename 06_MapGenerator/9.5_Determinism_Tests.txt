@@ -1,0 +1,305 @@
+# MDU 9.5: 矩形区域延迟生成与种子确定性回归测试
+
+## 任务目标
+
+将之前所有的子系统（确定哈希、加权地形、模板覆盖、怪物等级计算、城邦去重及 Boss 城堡）优雅拼装进 `MapGenerator` 主类中，完成矩形视口"延迟按需加载"，并完成地图一致性因果铁律的全局压测回归。
+
+**输出标准**：优先级链不可颠倒；主类内禁止缓存状态（必须 Stateless Lazy Generator）；种子因果律绝对成立。
+
+---
+
+## 1. 主框架装配与批量契约（不可更改方法签名）
+
+### 1.1 MapGenerator 主类
+
+```kotlin
+class MapGenerator(val seed: Long) {
+    // 1. 生成单个坐标的瓦片数据（强幂等纯函数）
+    fun generateTile(
+        coordinate: Coordinate,
+        knownCityCoordinates: Set<Coordinate> = emptySet()
+    ): GeneratedTile
+
+    // 2. 批量生成指定矩形窗口范围内的所有瓦片数据（用于地图视口延迟加载）
+    fun generateRegion(
+        topLeft: Coordinate,
+        bottomRight: Coordinate,
+        knownCityCoordinates: Set<Coordinate> = emptySet()
+    ): List<GeneratedTile>
+}
+```
+
+---
+
+## 2. 机械式步骤指令
+
+### 2.1 拼装主生成算法（generateTile）
+
+**优先级链（互斥排他性，不可颠倒）**：
+
+```
+大本营模板覆盖 > Boss 城堡生成 > 稀疏城邦生成 > 普通荒野地形与小怪
+```
+
+**一旦判定为 Boss 候选坐标**：绝对不能在其上刷小怪或刷出城邦。
+
+**一旦判定为城邦**：也绝不能在其上刷野怪。
+
+#### 步骤 A：大本营 5×5 模板检索
+
+```kotlin
+fun generateTile(
+    coordinate: Coordinate,
+    knownCityCoordinates: Set<Coordinate> = emptySet()
+): GeneratedTile {
+    // 步骤 A：大本营 5×5 模板检索
+    val template = getCampTemplate(coordinate)
+    if (template != null) {
+        return GeneratedTile(
+            coordinate = coordinate,
+            terrainTypeId = template.terrainTypeId,
+            initialExploreStatus = template.initialExploreStatus,
+            monsterTypeId = template.monsterTypeId,
+            monsterLevel = template.monsterLevel,
+            isBossLocation = false,
+            bossTypeId = null,
+            cityStateTypeId = null
+        )
+    }
+    
+    // 步骤 B：Boss 环带覆盖检索
+    val zone = getZone(coordinate)
+    if (isBossCandidate(coordinate)) {
+        val terrain = generateTerrainType(seed, coordinate.x, coordinate.y, zone)
+        val distance = getDistance(coordinate)
+        return GeneratedTile(
+            coordinate = coordinate,
+            terrainTypeId = terrain,
+            initialExploreStatus = "UNEXPLORED",
+            monsterTypeId = null,      // Boss 地块不刷野怪
+            monsterLevel = null,
+            isBossLocation = true,
+            bossTypeId = getBossType(distance),
+            cityStateTypeId = null       // Boss 地块不生成城邦
+        )
+    }
+    
+    // 步骤 C：稀疏城邦匹配检索
+    if (isCityStateCandidate(coordinate) &&
+        !checkCityStateSparsity(coordinate, knownCityCoordinates)) {
+        return GeneratedTile(
+            coordinate = coordinate,
+            terrainTypeId = "CITY_STATE",  // 地形强行篡改为 CITY_STATE
+            initialExploreStatus = "UNEXPLORED",
+            monsterTypeId = null,            // 城邦不刷野怪
+            monsterLevel = null,
+            isBossLocation = false,
+            bossTypeId = null,                // 城邦不生成 Boss
+            cityStateTypeId = getCityStateType(coordinate)
+        )
+    }
+    
+    // 步骤 D：普通荒野结算
+    val terrain = generateTerrainType(seed, coordinate.x, coordinate.y, zone)
+    val monster = generateMonster(seed, coordinate.x, coordinate.y, terrain, zone)
+    
+    return GeneratedTile(
+        coordinate = coordinate,
+        terrainTypeId = terrain,
+        initialExploreStatus = "UNEXPLORED",
+        monsterTypeId = monster?.monsterTypeId,
+        monsterLevel = monster?.level,
+        isBossLocation = false,
+        bossTypeId = null,
+        cityStateTypeId = null
+    )
+}
+```
+
+### 2.2 实现矩形视口窗口滑动加载（generateRegion）
+
+```kotlin
+fun generateRegion(
+    topLeft: Coordinate,
+    bottomRight: Coordinate,
+    knownCityCoordinates: Set<Coordinate> = emptySet()
+): List<GeneratedTile> {
+    val result = mutableListOf<GeneratedTile>()
+    
+    for (x in topLeft.x..bottomRight.x) {
+        for (y in topLeft.y..bottomRight.y) {
+            val coord = Coordinate(x, y)
+            val tile = generateTile(coord, knownCityCoordinates)
+            result.add(tile)
+        }
+    }
+    
+    return result
+}
+```
+
+---
+
+## 3. 禁止事项（硬性约束）
+
+1. **优先度判定错乱红线**：在拼装 `generateTile` 时，必须严格遵循优先级链条（大本营模板 > Boss 城堡 > 稀疏城邦 > 普通荒野），防止战役重叠 Bug。
+
+2. **禁止在主类内存储格子缓存 state**：所有生成动作必须每次按需就地计算（Stateless Lazy Generator），否则存档读档后容易发生内存数据分裂。
+
+3. **禁止 Boss 地块刷野怪**：isBossLocation = true 时，monsterTypeId 和 monsterLevel 必须强制设为 null。
+
+4. **禁止城邦地块刷野怪或 Boss**：cityStateTypeId != null 时，monsterTypeId、monsterLevel、bossTypeId 必须强制设为 null。
+
+---
+
+## 4. 测试规范：MapGenRegressionTest.kt
+
+### 4.1 测试原则
+
+⚠️ 因果律测试强制规则：相同种子 + 相同坐标必须产生完全相同的 GeneratedTile。
+
+### 4.2 测试用例
+
+**T01：世界种子绝对因果确定性验证**
+
+- 目的：验证种子因果律绝对成立
+- 步骤：
+  1. 分别独立实例化两个种子均设为 88888L 的 MapGenerator 实例（A 和 B）
+  2. 生成 Coordinate(1234, -5678) 的瓦片
+  3. 对比二者的每一个字段
+- 断言 1：地形、探索迷雾、野怪类型及等级必须一字不差完全相等（因果绝对确定）
+- 步骤：
+  1. 实例化第三个种子设为 99999L 的 MapGenerator 实例 C
+  2. 生成相同坐标的瓦片
+- 断言 2：C 产生的数据与 A 的结果不一致，确保种子特异性
+- 通过标准：因果律成立 + 种子特异性成立
+
+**T02：三级互斥覆盖链回归测试**
+
+- 目的：验证优先级链互斥排他性
+- 步骤：
+  1. 寻找一个 d ≈ 10 的 Boss 候选坐标（假定为 Candidate 且哈希摇号中奖）
+  2. 调用 generateTile(coordinate, emptySet())
+- 断言：
+  - isBossLocation 严格为 true
+  - cityStateTypeId 必须精准为 null
+  - monsterTypeId 必须为 null
+- 通过标准：互斥优先级链条成立
+
+**T03：矩形视口批量区域生成尺寸测试**
+
+- 目的：验证 generateRegion 返回正确数量的瓦片
+- 步骤：
+  1. 设定视口：topLeft = Coordinate(-2, -2)，bottomRight = Coordinate(3, 3)
+  2. 计算：x ∈ [-2, -1, 0, 1, 2, 3] → 6 个值；y ∈ [-2, -1, 0, 1, 2, 3] → 6 个值
+  3. 6 × 6 = 36 个瓦片
+  4. 调用 generateRegion
+- 断言：返回列表的大小精准等于 36
+- 通过标准：视口边界包含无缺失，完美支持 UI 按需延迟加载
+
+**T04：城邦稀疏去重集成测试**
+
+- 目的：验证已知城邦集合传入后，城邦候选判定被正确拦截
+- 步骤：
+  1. 设定 knownCityCoordinates = setOf(Coordinate(8, 0))
+  2. 对 Coordinate(10, 1) 调用 generateTile
+- 断言：生成的瓦片 cityStateTypeId 必须为 null（被稀疏去重拦截）
+- 通过标准：集成去重正确
+
+---
+
+## 5. 测试框架要求
+
+- 使用 kotlin.test 断言库
+- 每个测试方法独立，无执行顺序依赖
+- 禁止使用反射访问私有字段
+- 因果律测试需对比两个独立实例的生成结果
+
+---
+
+## 6. 输出要求
+
+1. 仅输出 Kotlin 代码文件（MapGenerator.kt + MapGenRegressionTest.kt）
+2. 包含：MapGenerator 主类、generateTile（4 级优先级链）、generateRegion（双层 for 循环）
+3. 不包含：子模块实现（直接调用 MDU 9.1~9.4 的函数）
+4. 代码格式：遵循 Kotlin 官方约定
+
+---
+
+## 7. 模块边界说明
+
+**MDU 9.1（已完成）**：确定性哈希、欧氏距离分区
+**MDU 9.2（已完成）**：大本营模板、动态地形权重
+**MDU 9.3（已完成）**：确定性怪物生成、动态等级保底
+**MDU 9.4（已完成）**：Boss 环带生成、稀疏城邦、碰撞去重
+**MDU 9.5（本章）**：主框架装配、矩形延迟生成、种子回归
+
+---
+
+## 8. 语义级冻结声明
+
+当本 MDU 及其配套测试完全通过后，`MapGenerator` 核心语义冻结。
+
+### 8.1 冻结语义边界
+
+1. **伪随机因果铁律**：所有随机分配算法（地形百分权重区间划分、刷怪概率判定）必须完全绑定数论哈希 `hash(seed, x, y)`，任何改动不得动摇其绝对幂等基底。
+
+2. **大本营 5×5 绝对硬编码覆盖**：开局 11 个黄金坐标模板设定终生冻结。
+
+3. **覆盖层优先链**：大本营 > Boss 环带 > 稀疏城邦 > 普通荒地小怪的排他互斥关系永不打破。
+
+### 8.2 允许进化范围 (Permitted Evolutions)
+
+- 允许在 Dynamic Terrain 中微调个别高级环形带的地形百分比划分
+- 禁止更改三项核心伪随机幂等哈希和排他层级规约
+
+---
+
+## 9. 快速行为查阅
+
+**generateTile 优先级链**：
+```
+generateTile(Coordinate(0, 0), knownCities)
+  → getCampTemplate(Coordinate(0, 0)) != null
+  → 返回模板瓦片（isBossLocation=false, cityStateTypeId=null）
+
+generateTile(bossCoord, knownCities)
+  → getCampTemplate = null
+  → isBossCandidate(bossCoord) = true
+  → 返回 Boss 瓦片（isBossLocation=true, monsterTypeId=null, cityStateTypeId=null）
+
+generateTile(cityCoord, knownCities)
+  → getCampTemplate = null
+  → isBossCandidate = false
+  → isCityStateCandidate = true && sparsity check pass
+  → 返回城邦瓦片（cityStateTypeId="FARMING", monsterTypeId=null, bossTypeId=null）
+
+generateTile(wildCoord, knownCities)
+  → getCampTemplate = null
+  → isBossCandidate = false
+  → isCityStateCandidate = false
+  → 返回普通荒野瓦片（terrain from generateTerrainType, monster from generateMonster）
+```
+
+**generateRegion 双层循环**：
+```
+generateRegion(Coordinate(-2, -2), Coordinate(3, 3))
+  → x in -2..3 → 6 values
+  → y in -2..3 → 6 values
+  → 6 × 6 = 36 tiles
+  → return List<GeneratedTile>(36)
+```
+
+**因果律验证**：
+```
+Generator A (seed=88888L).generateTile(Coordinate(1234, -5678))
+  → terrain = "...", monster = ..., level = ...
+
+Generator B (seed=88888L).generateTile(Coordinate(1234, -5678))
+  → terrain = "..."（与 A 完全相同）
+  → monster = "..."（与 A 完全相同）
+  → level = ...（与 A 完全相同）
+
+Generator C (seed=99999L).generateTile(Coordinate(1234, -5678))
+  → 结果与 A 不一致（种子特异性）
+```

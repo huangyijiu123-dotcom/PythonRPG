@@ -1,0 +1,106 @@
+# MDU 12.1: 建筑枚举、数据模型与静态配置表 (MDU-A: Models & Configuration)
+
+作为 AI 建造与经营经营专家，你的任务是为建筑生命周期管理系统定义完备的建筑类型、建筑运行状态机模型、只读硬编码的地形资源消耗配置矩阵，并设置安全的建筑状态存储查询容器。
+
+---
+
+## 1. 建筑数据与配置契约 (Data Contract)
+
+在桥接器中定义以下核心枚举、建筑快照数据类以及静态配置包（确保高内聚隔离性）：
+
+```kotlin
+// 1. 十六大核心建筑类型
+enum class BuildingType {
+    ROYAL_CASTLE,   // 🏰 大本营王城
+    COTTAGE,        // 🏠 村民民房
+    LUMBER_CAMP,    // 🪓 森林伐木场
+    QUARRY,         // ⛏️ 采石场
+    MINE,           // ⛏️ 采矿场
+    FARM,           // 🌾 农产农田
+    ALCHEMY_LAB,    // 🧪 炼金工坊
+    LOCAL_STORAGE,  // 📦 地方物资仓库
+    DISTRIBUTION,   // 🏛️ 物流分拨中心
+    CARAVAN_POST,   // 🏪 商队驿站
+    BLACKSMITH,     // 🔨 装备铁匠铺
+    TAVERN,         // 🍺 英雄酒馆
+    ACADEMY,        // 🏛️ 科学院
+    WORKSHOP,       // 🏭 生产工房
+    ICE_CELLAR,     // 🧊 冰窖深冷仓库
+    FURNACE         // 🔥 高温熔炉
+}
+
+// 2. 四大核心运行状态
+enum class BuildingState {
+    UNDER_CONSTRUCTION,  // 建造中
+    ACTIVE,              // 正常运作
+    UPGRADING,           // 升级中
+    DESTROYED            // 毁坏残骸
+}
+
+// 3. 建筑配置规则定义
+data class BuildingTypeConfig(
+    val allowedTerrains: Set<String>,      // 允许放置的合法地形集合
+    val woodCost: Int,                     // 基础建造木材消耗
+    val stoneCost: Int,                    // 基础建造石材消耗
+    val maxLevel: Int,                     // 最大等级上限
+    val baseConstructionTicks: Int         // 基础建造所需时长 Tick
+)
+
+// 4. 建筑状态实时数据快照
+data class BuildingSnapshot(
+    val buildingId: Long,
+    val type: BuildingType,
+    val x: Int,
+    val y: Int,
+    var level: Int,
+    var state: BuildingState,
+    var constructionProgress: Int,         // 当前进度
+    val maxConstructionProgress: Int,      // 达标所需总进度 Tick
+    val customData: MutableMap<String, Int> = mutableMapOf() // 存储特定加成数据
+)
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **静态消耗及地形配置红线 (Strict Static Configs)**：
+   民房、伐木场等**核心建筑物造价和地形要求必须静态硬编码锁定**，绝对禁止引入运行时动态改写，防止游戏物产成本失衡。
+2. **禁止参数空缺**。
+
+### 机械式步骤指令：
+1. **硬编码静态配置表字典配置**（在 `BuildingEngine` 内声明 `val buildingConfigs: Map<BuildingType, BuildingTypeConfig>`）：
+   - `COTTAGE` (民房)：地形为 `{"PLAINS"}`，木材 30，石材 0，上限 5 级，基础 3 Tick。
+   - `LUMBER_CAMP` (伐木场)：地形为 `{"FOREST"}`，木材 50，石材 0，上限 5 级，基础 4 Tick。
+   - `QUARRY` (采石场)：地形为 `{"MOUNTAIN"}`，木材 30，石材 20，上限 5 级，基础 4 Tick。
+   - `ICE_CELLAR` (冰窖仓库)：地形为 `{"TUNDRA"}`，木材 0，石材 100，上限 3 级，基础 6 Tick。
+   - 对于 `DISTRIBUTION`（分拨中心）、`LOCAL_STORAGE`（地方仓库）、`ROYAL_CASTLE`（王城）：地形允许为 `{"PLAINS", "FOREST"}`，木材 100，石材 50，上限 5 级，基础 10 Tick。其余未特殊注明类型默认配置合理数值。
+2. **构建高安全的并发存储容器**：
+   - 实例化 `class BuildingEngine`。
+   - 内部维护并发安全的建筑物容器字典及唯一 ID 原子发生器：
+     - `private val buildings = ConcurrentHashMap<Long, BuildingSnapshot>()`
+     - `private val buildingIdGenerator = AtomicLong(1L)`
+3. **编写检索 API**：
+   - `fun getBuildingAt(x: Int, y: Int): BuildingSnapshot?`：遍历 `buildings.values`，定位坐标 `x` 与 `y` 相符的建筑快照。
+   - `fun getBuildingsByType(type: BuildingType): List<BuildingSnapshot>`：过滤 `buildings.values` 中 `type` 与目标一致的建筑列表副本。
+
+---
+
+## MDU 12.1-TEST: 建筑配置矩阵与基础检索黑盒测试
+
+编写单元测试 `BuildingConfigAndStorageTest.kt`
+
+### 机械式测试用例：
+1. **硬编码静态参数配置精度校验**：
+   - 提取 COTTAGE (民房) 配置。
+   - **断言 1**：允许地形仅为 `"PLAINS"`，且最大等级 `maxLevel` 精准等于 `5`。
+   - 提取 ICE_CELLAR (冰窖仓库) 配置。
+   - **断言 2**：石材消耗 `stoneCost` 精准等于 `100`，且最大等级上限为 `3`。
+2. **建筑列表并发检索空值防御测试**：
+   - 实例化 `BuildingEngine`。
+   - 检索 `(50, 50)` 坐标地块。
+   - **断言**：返回 `null`（证明无悬空残留），无任何异常抛出。
+
+### 交付物：
+只包含基础建筑数据模型、静态硬编码配置字典、并发字典查询方法实现、以及配置项精度的 JUnit 单元测试代码。不含任何建造校验启动、Tick 进度老化及物流分拨半径计算逻辑。

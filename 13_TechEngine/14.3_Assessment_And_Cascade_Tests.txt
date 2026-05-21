@@ -1,0 +1,82 @@
+# MDU 14.3: 沙盒代码考核对决与解锁锁链级联传导 (MDU-C: Assessment & Cascades)
+
+作为 AI 科技树管理专家，你的任务是为科技树系统编写接收沙盒考核回调的“通过/失败事务决断器”、解锁完工时的“质押资源正式核销扣除器”，以及将解封状态顺着树脉络层层传导的“级联依赖传导算法”。
+
+---
+
+## 1. 考核对决与锁链传导契约 (Assessment & Cascade Contract)
+
+在科技树管理引擎中实现代码提交考核结算 API（确保在多分支依赖传导下的拓扑自洽性）：
+
+```kotlin
+// 提交沙盒对于当前研究科技的代码考核运行结果
+// isPassed 为 true 代表通过考验解锁；为 false 代表未通过（零惩罚原地重试设计）
+fun submitAssessmentResult(techId: String, isPassed: Boolean)
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **未在研状态篡改红线 (No Assessment for Inactive Node)**：
+   在调用 `submitAssessmentResult` 时，**必须严格限制当前状态**！只有当前状态处于 `TechState.RESEARCHING` 的科技才允许接受考核结算，其余一律原地退回，防止外部脚本越权伪造考试通过结论。
+2. **失败零惩罚原则**：考核失败（`isPassed == false`）时，**绝对禁止退还材料、扣除材料或回滚状态**！必须原封保持在 `RESEARCHING`，等待玩家再次修复脚本无限重试，捍卫零挫败感学习体验。
+
+### 机械式步骤指令：
+1. **考核事务决断算法实现 (`submitAssessmentResult`)**：
+   - 步骤 A：提取节点：`val node = nodes[techId] ?: return`（防护空节点）。
+   - 步骤 B：**在研状态审查**：
+     - 若 `node.state != TechState.RESEARCHING`，直接拦截退出。
+   - 步骤 C：**分支结算**：
+     - **若考核大捷 (`isPassed == true`)**：
+       - 修改状态标记：`node.state = TechState.UNLOCKED`。
+       - **物料正式核销**：调用依赖：`dependencyProvider.consumePledgedResources(node.cost)`。
+       - **触发全局解锁广播**：调用依赖：`dependencyProvider.onTechUnlockedGlobalEvent(techId)`。
+       - **锁链级联依赖传导（核心算法）**：
+         - 提取当前快照，遍历树中所有处于 `TechState.LOCKED` 状态的节点 $N$：
+           - 核对 $N$ 的所有前置依赖（`prerequisites`）列表：
+             - 若 $N$ 依赖的**每一项前置科技**的最新状态均为 `TechState.UNLOCKED`：
+               - 瞬间解封！将 $N$ 的状态更新为 `TechState.AVAILABLE`，打开未来的研发通道。
+     - **若考核失败 (`isPassed == false`)**：
+       - 遵守零惩罚铁律，不调用消耗或退还，状态原封保持为 `TechState.RESEARCHING`，静默等待重构考核。
+
+---
+
+## MDU 14.3-TEST: 考核对决分支结算与级联锁链解封测试
+
+编写单元测试 `TechAssessmentAndCascadeTest.kt`。
+
+### 机械式测试用例：
+1. **代码考核失败零惩罚回归测试**：
+   - 将 `"BACKPACK_WEAVING"` 设为 `RESEARCHING` 状态，并模拟质押木材 50。
+   - 设定核销与退料监听器：预期无任何回调。
+   - 调用 `submitAssessmentResult("BACKPACK_WEAVING", false)`（考核未通过）。
+   - **断言 1**：状态铁律不变，依然严格为 `TechState.RESEARCHING`。
+   - **断言 2**：既没有调用正式消耗，也没有原路退料，资源依旧处于安全冻结质押。
+2. **考核通过质押核销与锁链级联解封测试**：
+   - 设定初始：王牌前置 `"BASIC_MANAGEMENT"` 已进入 `RESEARCHING`，且木材 50 的 `"BACKPACK_WEAVING"`、石材 500 的 `"ADVANCED_BUILDING"`、古物 5 的 `"ARCHEOLOGY"` 初始因为依赖 `"BASIC_MANAGEMENT"` 而处于 `LOCKED`。
+   - 调用 `submitAssessmentResult("BASIC_MANAGEMENT", true)`（基础考核全通过）。
+   - **断言 1**：`BASIC_MANAGEMENT` 状态成功飞跃至 `TechState.UNLOCKED`。
+   - **断言 2**：依赖于它的下级锁链 `"BACKPACK_WEAVING"`、`"ADVANCED_BUILDING"`、`"ARCHEOLOGY"` 的状态**在一瞬间同时自动跳变变为了 `TechState.AVAILABLE`**，前置障碍扫清！
+   - **断言 3**：物流分拨中心 `"DISTRIBUTION_CENTER"` 需要两个前置，此时其状态依然稳固为 `LOCKED`（逻辑高度正确）。
+3. **多线程并发科研、取消与考核零脏读压测**：
+   - 实例化 `TechEngine`。
+   - 启动 50 个高并发协程 Workers 并发轰炸：
+     - 一半协程并发执行状态读取及快照获取。
+     - 另一半并发执行 `startResearch`、`cancelResearch` 与 `submitAssessmentResult`。
+   - **断言**：高频轰炸 2000 次以上，科技树拓扑传导准确，ConcurrentHashMap 零报错脏读，系统零死锁。
+
+---
+
+## 🔒 语义级冻结声明 (Semantic-Level Freeze Declaration)
+
+当本 MDU 及其配套测试完全通过后，`TechEngine` 核心语义冻结。
+
+### 冻结语义边界：
+1. **13节点关系及造价图谱锁定**：密码学（前置考古）、分拨中心（前置高级建筑/物流调度）等前置关系与研发造价终生静硬化锁定。
+2. **级联解封铁律**：前置全解锁时，下级 LOCKED 节点必须立刻级联飞跃为 AVAILABLE 态。
+3. **失败零惩罚**：考核失败时不扣料不退料，状态原装。
+
+### 允许进化范围 (Permitted Evolutions)：
+- 允许在 13 节点之外增加科技枝叶（如“精密齿轮学”），但新节点的依赖挂载和时序流转必须完全遵循本模块的 Pledge-Cancel-Cascade 解锁传导生命周期设计。

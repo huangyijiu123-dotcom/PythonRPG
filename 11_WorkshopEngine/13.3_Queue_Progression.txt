@@ -1,0 +1,64 @@
+# MDU 13.3: 槽位并行限制心跳推进与成品出库交付 (MDU-C: Multi-Slot Progress & Deliveries)
+
+作为 AI 工房生产与经营专家，你的任务是将外部总心跳挂接进生产队列，根据各工房最大制造并行槽位数限制同时推进多个任务进度，并在成品达成瞬间自动触发反向交付出库回调。
+
+---
+
+## 1. 进度心跳与交付出库契约 (Tick & Delivery Contract)
+
+在生产引擎中声明并实现心跳时序推进接口（确保并行限幅在并发下的数据一致性）：
+
+```kotlin
+// 外部中央时钟在每 Tick 推进时主动调用，滚动所有注册工房的多槽位活跃任务进度
+fun processTick()
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **多并行槽位超额推进红线 (Max Parallel Slots Limit)**：
+   每个工房能并行处理的最大项目数严格受 `maxSlots`（默认 1）限制！**在 processTick 时，每座工房绝对禁止超出前 `maxSlots` 个任务进行进度增加**！超出槽位限制的后续任务必须在队列中静止排队挂起（即其 `currentProgress` 绝不自增），保护多槽位并行经营玩法的物理公平度。
+2. **禁止静默流逝**：当单个工具耗时到期时，必须立刻调用 `dependencyProvider.addToolToWarehouse` 反向通知库房模块将成品正式入库。
+
+### 机械式步骤指令：
+1. **心跳时序多槽位推进算法实现 (`processTick`)**：
+   - 遍历 `workshops.values` 的所有工房实体状态副本：
+     - 获取当前活跃列表 `val tasks = state.activeTasks`。
+     - 若 `tasks.isEmpty()`，安全跳过。
+     - **槽位限幅推进**：
+       - 根据 `state.maxSlots`，最多提取队列最前方的 `maxSlots` 个任务进行并行滚动（例如若 maxSlots=2，则 `tasks.take(2)`）。
+       - 对于每一个并行执行的任务 `task`：
+         - 递增当前工件进度：`task.currentProgress += 1`。
+         - **单件工具交付判定**：
+           - 若 `task.currentProgress >= task.requiredTicks`：
+             - **反向同步交付入库**：调用 `dependencyProvider.addToolToWarehouse(state.buildingId, task.toolType)`。
+             - 本批次已完成数累加：`task.completedCount += 1`。
+             - 当前工件进度重设归零：`task.currentProgress = 0`。
+     - **批次大完工注销**：
+       - 遍历活跃队列，将所有已大功告成（`task.completedCount >= task.totalCount`）的任务，物理从 `state.activeTasks` 列表中移除（可使用 `MutableList.removeIf` 或 Iterator 线程安全剥离），空出队列位置。
+
+---
+
+## MDU 13.3-TEST: 多槽位并行限额推进与单件/批量完工交付测试
+
+编写单元测试 `WorkshopProgressAndDeliveryTest.kt`。
+
+### 机械式测试用例：
+1. **多槽位并行限幅拦截测试**：
+   - 注册一个 `maxSlots = 2` 的工房。
+   - 往队列塞入三个石斧任务：任务 A (1个)、任务 B (1个)、任务 C (1个)，每个标准耗时 3 Ticks。
+   - 调用一次 `processTick()`。
+   - **断言 1**：最前方任务 A 和 B 的进度 `currentProgress` 均变为 `1`（证明双槽位并行工作）。
+   - **断言 2**：排队挂起任务 C 的进度依旧死锁精准为 `0`，没有被多余滚动，完美守护槽位限制。
+2. **单件完工交付与下一件重置测试**：
+   - 注册 `maxSlots = 1` 工房。排单生产 `2` 个纤维背包（单个耗时 2 ticks）。
+   - 设定成品入库监听回调。
+   - 推进第 1 次 Tick，进度为 1。推进第 2 次 Tick，进度到达 2。
+   - **断言 1**：回调在第 2 次 Tick 瞬间被触发，背包入库。已完成数 `completedCount` 精准自增为 `1`，但该 ProductionTask 依然留在活跃队列中，且进度重置归零。
+   - 再次推进 2 次 Ticks。
+   - **断言 2**：第二只背包入库。由于本批次总量已达成 $2/2$，该任务彻底从 `activeTasks` 中剔除消失，队列大扫除完毕。
+
+### 交付物：
+只包含 `processTick` 时序推进、多槽位并行切分、成品入库交付与大批次完工注销算法、以及槽位限幅 JUnit 单元测试代码。不含放置合法性拦截及中途取消未造退款逻辑。

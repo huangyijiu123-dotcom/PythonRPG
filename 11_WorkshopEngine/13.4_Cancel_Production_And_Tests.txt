@@ -1,0 +1,77 @@
+# MDU 13.4: 制造中途退款核销与多槽位高并发压测 (MDU-D: Cancels & Concurrency Tests)
+
+作为 AI 工房生产与经营专家，你的任务是为制造队列提供“中途取消未开始部分的 100% 耗材退款结算器”，并对整体引擎执行多线程高并发下的“线程安全无锁死性能压测”。
+
+---
+
+## 1. 任务中途取消与退料核销契约 (Cancel & Safety Contract)
+
+在生产引擎中编写制造任务取消及材料返还公式，并对高频并发执行时状态的一致性做出防御性测试：
+
+```kotlin
+// 取消指定工房的指定任务的未开始制造部分，折算退还 100% 材料并移出队列
+// 退还数量公式：unstartedCount = totalCount - completedCount
+fun cancelProduction(workshopId: Long, taskId: Long)
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **已开工折算漏减红线 (Accurate Refund Counting Redline)**：
+   在计算材料退还时，**必须严格按件结算**！退还的工具总量为未出库的全部剩余数量：
+   $$\text{退料总量} = \text{totalCount} - \text{completedCount}$$
+   *注意：当前正在制造的那一件虽然有 currentProgress 进度，但也尚未产出出库，契约默认将其一并折算为未开始部分的 100% 退料，保障玩家取消订单时的资源不丢失。*
+2. **禁止静默流失与死锁**：整体任务必须在一瞬间从 `activeTasks` 活跃序列中物理摘除，不残余。
+
+### 机械式步骤指令：
+1. **制造中途取消退料核销算法实现 (`cancelProduction`)**：
+   - 步骤 A：获取工房状态：`val state = workshops[workshopId] ?: return`。
+   - 步骤 B：**提取并定位任务**：
+     - 在 `state.activeTasks` 中寻找 `task.taskId == taskId` 的任务。若找不到，直接退回。
+   - 步骤 C：**材料百分百退还折算**：
+     - 计算未开始制造的套数：`val unstartedCount = task.totalCount - task.completedCount`。
+     - 若 $unstartedCount > 0$：
+       - 获取该工具配方：`val recipe = recipes[task.toolType] ?: return`。
+       - 折算应退总材料：`val refundCost = recipe.materialCost.mapValues { (_, qty) -> qty * unstartedCount }`。
+       - 调用依赖反向加回资源：`dependencyProvider.refundResources(refundCost)`。
+   - 步骤 D：**注销剔除**：
+     - 从 `state.activeTasks` 中物理移出此 `task`，清空其槽位占用。
+
+---
+
+## MDU 13.4-TEST: 任务取消返料核算与高频并发读写零崩溃压测
+
+编写单元测试 `WorkshopCancellationStressTest.kt`。
+
+### 机械式测试用例：
+1. **中途取消精细退款核销测试**：
+   - 注册工房 ID `301L`。
+   - 排单制造 5 辆小推车 `ToolType.WHEELBARROW`（单价：木材 20）。
+   - 时钟递推进度，使其完工 `2` 辆（已出库，`completedCount = 2`），第 3 辆正在制造中。
+   - 设定退料接收器，监听退还材料总量。
+   - 调用 `cancelProduction(301L, taskId)` 取消剩余任务。
+   - **断言 1**：退还的木材总量精准等于 $(5 - 2) \times 20 = 60$ 根木头（剩余未出库的 3 辆 100% 返还）。
+   - **断言 2**：读取该工房活跃列表，该小车订单已被彻底撕毁剔除，队列放空。
+2. **极限多线程并发排单、推进与撤单零死锁压测**：
+   - 实例化 `WorkshopEngine` 并预注册 5 座工房。
+   - 启动 50 个高并发协程 Workers 并发轰炸：
+     - 20 个协程疯狂调用 `queueProduction` 不停投料排单。
+     - 20 个协程疯狂调用 `processTick()` 心跳推进多槽位并行。
+     - 10 个协程随时调用 `cancelProduction` 对任务执行强行撤单退料。
+   - **断言**：运行足够次数，系统未发生任何 ConcurrentModificationException 脏读崩溃，活跃队列状态自洽，未发生线程挂起死锁。
+
+---
+
+## 🔒 语义级冻结声明 (Semantic-Level Freeze Declaration)
+
+当本 MDU 及其配套测试完全通过后，`WorkshopEngine` 核心语义冻结。
+
+### 冻结语义边界：
+1. **配方图纸静态规则锁定**：石斧（木5）、铁斧（木5+铁3，门槛 IRON_FORGING）等静态耗时与科技配方永不动摇。
+2. **多槽位并行限幅**：时序推进必须遵守 maxSlots 的前置切分限制，严禁越过槽位并发。
+3. **退款换算无偏差**：撤单退款数量必须等于 `totalCount - completedCount` 且按 100% 比例原封退料。
+
+### 允许进化范围 (Permitted Evolutions)：
+- 允许后续增加生产工具品类（如“青铜盾牌”或“精钢长剑”）并配置耗料，但必须满足本模块的 Enqueue 安全拦截、心跳推进与撤单退还材料规约。

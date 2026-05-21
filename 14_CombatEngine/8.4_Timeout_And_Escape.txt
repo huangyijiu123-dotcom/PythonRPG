@@ -1,0 +1,74 @@
+# MDU 8.4: 连续超时自退避遭遇战与主动撤退机制 (MDU-D: Timeout & Flees)
+
+作为 AI 游戏战斗系统设计专家，你的任务是处理玩家挂机假死、断联超时倒计时归零，以及玩家受到野外伏击或手动召回时主动金蝉脱壳逃离战局的边缘流转逻辑。
+
+---
+
+## 1. 超时与撤退核心接口契约 (Interface Contract)
+
+在 `CombatEngine` 中声明并实现报告超时及主动撤退接口（确保时序状态转换正确）：
+
+```kotlin
+// 答题倒计时归零时，外部系统调用此接口报告超时
+// 连续 3 次超时将触发被迫逃避惩罚
+// 返回：战损回执 AnswerResult
+fun reportTimeout(sessionId: Long): AnswerResult
+
+// 主动逃跑（例如玩家下达了召回命令，或者脚本执行撤退）
+// 战斗会话强制无害回收，并发布撤退事件
+// 返回：BattleEndEvent 战斗终结事件
+fun fleeBattle(sessionId: Long): BattleEndEvent
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **防死锁与非空校验红线**：
+   在 `reportTimeout` 或 `fleeBattle` 中，**必须优先校验会话非空**。如果 `sessionId` 指向一个已经死亡或不存在的战局，不能引发 NullPointerException，必须安全报错或无害空返。
+2. **禁止超时逃逸时给予奖励**：因连续超时 3 次触发的 `TIMEOUT_ESCAPE` 或主动撤退 `FLEE`，**获取的经验 expGained 必须严格为 0，掉落物资 drops 必须严格为空 Map**，绝不能让偷懒玩家获得任何行军产出！
+
+### 机械式步骤指令：
+1. **实现答题超时判定 (`reportTimeout`)**：
+   - 步骤 A：定位战斗会话。若不存在，抛出异常。
+   - 步骤 B：**超时惩罚累加与连击重置**：
+     - 连续超时计数器自增：`session.consecutiveTimeoutCount += 1`。
+     - 连击熔断归零：`session.comboCount = 0`。
+   - 步骤 C：**怪物超时反击结算**（伤害等同于答错）：
+     $$D_{taken} = \max(1.0f, \text{monster.strength} \times 0.3f - Def_{adv} \times 0.3f).toInt()$$
+     扣减冒险者生命值：`session.adventurerCurrentHp = (session.adventurerCurrentHp - D_{taken}).coerceAtLeast(0)`。
+   - 步骤 D：**死斗及三连超时撤退检查**：
+     - 若 `session.adventurerCurrentHp <= 0`：调用 `endBattle(sessionId, BattleEndReason.ADVENTURER_INJURED)`。
+     - 若冒险者还活着，但 `session.consecutiveTimeoutCount >= 3`：
+       - 触发被迫自退避逃跑机制：调用 `endBattle(sessionId, BattleEndReason.TIMEOUT_ESCAPE)`。返回回执中 `sessionEnded = true`，结束原因 `"TIMEOUT_ESCAPE"`。
+     - 其余情况：返回正常的未终结回执。
+2. **实现主动金蝉脱壳 (`fleeBattle`)**：
+   - 定位战斗会话。
+   - **立即回收会话**：调用私有 `endBattle(sessionId, BattleEndReason.FLEE)`。
+   - 产生并向 SharedFlow 广播 `BattleEndEvent(sessionId, BattleEndReason.FLEE, expGained = 0, drops = emptyMap())`。
+
+---
+
+## MDU 8.4-TEST: 三连超时自动逃避与主动撤退黑盒测试
+
+编写单元测试 `CombatTimeoutFleeTest.kt`。
+
+### 机械式测试用例：
+1. **超时反击扣减与三连逃逸判定测试**：
+   - 启动一场普通小怪战斗，冒险者 HP = 100，怪物力量为 10，玩家防御为 10。
+   - 玩家前 2 次答题超时，调用 2 次 `reportTimeout`。
+   - **断言 1**：前 2 次返回的 `sessionEnded` 均为 `false`。
+   - **断言 2**：`consecutiveTimeoutCount` 累加到 `2`。
+   - **断言 3**：玩家 HP 每次都被扣除了 1 点反击伤害。
+   - 调用第 3 次 `reportTimeout`。
+   - **断言 4**：第 3 次调用返回 `sessionEnded == true`，`endReason` 为 `"TIMEOUT_ESCAPE"`。
+   - **断言 5**：广播事件库中收到 `TIMEOUT_ESCAPE` 结算事件，且其 drops 字典精准为空。
+2. **主动撤退内存即时物理切断测试**：
+   - 启动一场战斗，得到活跃的 `sessionId`。
+   - 调用 `fleeBattle(sessionId)`。
+   - **断言 1**：返回回执中的原因确为 `FLEE`，经验和掉落均为 0。
+   - **断言 2**：再次通过 `getSession(sessionId)` 查证，战局已经立刻从活动 Map 中物理移出。
+
+### 交付物：
+只包含 `reportTimeout` 与 `fleeBattle` 结算流转逻辑、三连超时自退避逻辑实现、以及对应超时逃脱和撤退的 JUnit 单元测试。不含手动正常作答、MP技能及自动挂机结算。

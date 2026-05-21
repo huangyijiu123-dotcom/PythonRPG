@@ -1,0 +1,249 @@
+# MDU 4.3: 超大搜索空间安全剪枝与极限性能验证
+
+## 任务目标
+
+为 `PathfindingEngine` 补充"超大搜索空间安全剪枝"行为规范，并进行极端迷宫与性能压测回归验证，确保引擎在复杂现实场景下具备严格的数值稳定性与算法效率底线。
+
+**输出标准**：openSet 内存上限熔断必须生效；StringGrid 辅助工具 O(1) 查询；100×100 大图寻路 < 10ms。
+
+---
+
+## 1. 超大搜索空间安全剪枝契约（不可更改方法签名）
+
+### 1.1 扩展版 findPath
+
+```kotlin
+// 在已有 maxSteps 限制的基础上，新增对 openSet 集合大小的内存上限保护
+// 若 openSet 中积压的待探节点超过 maxOpenNodes，立即放弃搜索，防止路径规划占用过多内存
+fun findPath(
+    fromX: Int, fromY: Int,
+    toX: Int, toY: Int,
+    grid: PassabilityGrid,
+    maxSteps: Int = 500,
+    maxOpenNodes: Int = 2000  // 新增参数：openSet 最大节点数防炸上限
+): PathResult
+```
+
+---
+
+## 2. 机械式步骤指令
+
+### 2.1 在 A* 主循环中追加 openSet 大小保护熔断
+
+**位置**：在 while 循环内、poll 之前追加检查。
+
+```kotlin
+while (openSet.isNotEmpty()) {
+    // openSet 内存上限熔断
+    if (openSet.size > maxOpenNodes) {
+        return PathResult(
+            found = false,
+            path = emptyList(),
+            totalSteps = stepsCount,
+            reason = "OPEN_SET_OVERFLOW"
+        )
+    }
+    
+    val current = openSet.poll()
+    // ... 后续逻辑不变
+}
+```
+
+### 2.2 实现 StringGrid 辅助工具类（供测试快速构建地图）
+
+```kotlin
+class StringGrid(val rows: List<String>) : PassabilityGrid {
+    private val height = rows.size
+    private val width = if (height > 0) rows[0].length else 0
+    
+    override fun isPassable(x: Int, y: Int): Boolean {
+        if (x !in 0 until width || y !in 0 until height) return false
+        return rows[y][x] == '.'
+    }
+}
+```
+
+**使用说明**：
+- `'.'` 代表可通行
+- `'#'` 代表障碍墙
+
+示例地图：
+```
+val maze = StringGrid(listOf(
+    "..........",
+    "#########.",
+    ".........."
+))
+```
+
+---
+
+## 3. 禁止事项（硬性约束）
+
+1. **测试反射泄漏红线**：测试代码只能通过 `findPath` 公开接口执行验证，**严禁断言 A* 内部的 openSet 大小、closedSet 内容、或私有 Node 实例字段**，防止测试深度耦合算法内部实现细节导致重构困难。
+
+2. **PassabilityGrid O(1) 性能要求红线**：测试中的 `PassabilityGrid` 实现必须保证 `isPassable(x, y)` 的查询复杂度为 O(1)，**严禁在 `isPassable` 内部执行耗时的 Map 查询或线性扫描**，否则性能测试计时将失真。
+
+3. **禁止移除 maxSteps 熔断**：`maxSteps` 和 `maxOpenNodes` 双重熔断必须同时存在，不可省略其中任何一个。
+
+---
+
+## 4. 测试规范：PathfindingEngineRegressionTest.kt
+
+### 4.1 测试原则
+
+⚠️ 黑盒性能测试强制规则：仅通过 `findPath` 返回结果断言；性能测试需预热 JVM（连续执行 100 次空旷地图寻路）。
+
+### 4.2 测试用例
+
+**T01：复杂 U 型迷宫深度绕避成功测试**
+
+- 目的：验证算法能绕开障碍找到全局最优解
+- 步骤：
+  1. 使用 `StringGrid` 构建 U 型迷宫（开口朝右）
+  2. 起点 `(2, 2)` 在 U 型坑深处（左侧）
+  3. 终点 `(5, 2)` 在墙外（右侧），中间被垂直墙壁封堵
+  4. 调用 `findPath`，允许充足 `maxSteps`
+- 断言：
+  - `found` == true
+  - `totalSteps` 精准吻合绕出 U 型墙的理论最短路径步数（证明未穿墙）
+- 通过标准：找到全局最优解
+
+**T02：100×100 大图单次寻路高效度时效压测**
+
+- 目的：验证 A* 在万级步数大图下的高效度
+- 步骤：
+  1. 初始化 100×100 全空旷网格（所有 `isPassable` 返回 `true`）
+  2. 连续执行 100 次 `findPath(0, 0, 99, 99, grid)` 预热 JVM
+  3. 记录第 100 次寻路耗时：
+```kotlin
+val start = System.nanoTime()
+val result = engine.findPath(0, 0, 99, 99, grid, maxSteps = 10000)
+val durationMs = (System.nanoTime() - start) / 1_000_000.0
+```
+- 断言：
+  - `found` == true
+  - `totalSteps` == 198（100×100 网格对角曼哈顿最短路径：99 + 99）
+  - `durationMs` < 10.0（毫秒）
+- 通过标准：时效达标
+
+**T03：openSet 防炸内存上限强制熔断测试**
+
+- 目的：验证 maxOpenNodes 熔断机制正确触发
+- 步骤：
+  1. 构建一个 50×50 的空旷地图
+  2. 设定极低的 `maxOpenNodes = 10`
+  3. 调用 `findPath(0, 0, 49, 49, grid, maxOpenNodes = 10)`
+- 断言：
+  - `found` == false
+  - `reason` == "OPEN_SET_OVERFLOW"
+- 通过标准：内存熔断生效
+
+**T04：双重熔断同时生效验证**
+
+- 目的：验证 maxSteps 和 maxOpenNodes 互不干扰
+- 步骤：
+  1. 构建中等复杂度地图
+  2. 分别设定 `maxSteps = 5`（低步数）和 `maxOpenNodes = 2000`（高内存）
+  3. 执行寻路
+- 断言：
+  - `reason` == "STEP_LIMIT_EXCEEDED"（步数先达到上限）
+- 通过标准：双重熔断独立生效
+
+---
+
+## 5. 测试框架要求
+
+- 使用 kotlin.test 断言库
+- 性能测试必须预热 JVM（至少 100 次预热）
+- 禁止使用反射访问私有字段
+- `StringGrid` 的 `isPassable` 必须是 O(1) 数组索引查询
+
+---
+
+## 6. 输出要求
+
+1. 仅输出 Kotlin 代码文件（PathfindingEngine.kt 扩展 + PathfindingEngineRegressionTest.kt）
+2. 包含：扩展版 findPath（含 maxOpenNodes 熔断）、StringGrid 辅助类
+3. 不包含：路径平滑、双向 A*、其他寻路算法
+4. 代码格式：遵循 Kotlin 官方约定
+
+---
+
+## 7. 模块开发验收流程（Development Checklist）
+
+当且仅当以下测试全部满足时，`PathfindingEngine` 算法引擎方可宣布完美交付：
+
+- [ ] **MDU 4.1**：测距辅助公式（曼哈顿/欧几里得）负数跨象限及 Node 排序优先级测试 100% 通过
+- [ ] **MDU 4.2**：A* 核心寻路起点短路、不可通断路拦截及步数上限熔断测试 100% 通过
+- [ ] **MDU 4.3**：U 型迷宫绕行、100×100 大图时效低于 10ms、openSet 防炸熔断测试 100% 通过
+
+---
+
+## 8. 模块边界说明
+
+**MDU 4.1（已完成）**：基础结构、测距函数、Node 定义
+**MDU 4.2（已完成）**：A* 核心寻路、步数熔断
+**MDU 4.3（本章）**：超大搜索空间剪枝、性能压测、验收清单
+**MDU 4.4（后续）**：路径平滑与优化（可选）
+**MDU 4.5（后续）**：语义冻结声明
+
+---
+
+## 9. 语义级冻结声明
+
+当本 MDU 及其配套测试完全通过后，`PathfindingEngine` 核心语义冻结。
+
+### 9.1 冻结语义边界
+
+1. **四方向纯正交寻路**：只允许上下左右正交步进，永远不计算对角线路径。
+2. **双重熔断安全锁**：`maxSteps` 步数限制与 `maxOpenNodes` 内存节点限制二者均不可省略。
+3. **无状态纯函数**：`findPath` 是纯计算方法，无副作用，禁止维护任何跨调用状态缓存。
+
+### 9.2 允许进化范围 (Permitted Evolutions)
+
+- 允许增加加权地形代价支持（如泥地移动成本翻倍），但必须保持四方向正交和熔断机制不变
+- 允许优化 Node 内部 g/h/f 计算方式，但必须保持接口签名不变
+
+---
+
+## 10. 快速行为查阅
+
+**openSet 熔断**：
+```
+findPath(0, 0, 49, 49, grid, maxOpenNodes=10)
+  → while (openSet.isNotEmpty())
+  →   if (openSet.size > 10) → 返回 PathResult(reason="OPEN_SET_OVERFLOW")
+  →   （10 个节点入队后即熔断）
+```
+
+**StringGrid 使用**：
+```
+val grid = StringGrid(listOf(
+    "..........",  // 第 0 行
+    "###.#####",   // 第 1 行，# 是墙
+    ".........."    // 第 2 行
+))
+grid.isPassable(0, 0) → true（'.'）
+grid.isPassable(1, 1) → false（'#'）
+```
+
+**性能压测**：
+```
+// 预热
+repeat(100) {
+    engine.findPath(0, 0, 99, 99, openGrid, maxSteps=10000)
+}
+// 正式计时
+val start = System.nanoTime()
+val result = engine.findPath(0, 0, 99, 99, openGrid, maxSteps=10000)
+val durationMs = (System.nanoTime() - start) / 1_000_000.0
+// assertion: durationMs < 10.0
+```
+
+**U 型迷宫绕行**：
+```
+起点 (2, 2) → 被墙封堵 → 必须绕行 → 终点 (5, 2)
+  → found == true
+  → totalSteps == 理论最短绕行步数（非穿墙直线距离）
+```

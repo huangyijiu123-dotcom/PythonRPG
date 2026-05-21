@@ -1,0 +1,89 @@
+# MDU 7.4: 玩家进出口贸易结算执行器 (MDU-D: Trade Execution)
+
+作为 AI 经济学与结算专家，你的任务是为 `MarketEngine` 编写核心玩家买卖业务交易逻辑，处理仓库满溢限制及倾销惩罚折算。
+
+---
+
+## 1. 核心买卖结算接口契约 (Interface Contract)
+
+在 `MarketEngine` 中实现以下两大核心贸易结算接口（必须高度自闭，不产生线程竞态）：
+
+```kotlin
+// 1. 玩家向城邦卖出物资结算
+// 参数：amount 必须大于 0，currentTickId 用于滑窗倾销判定
+fun sell(cityId: Long, item: String, amount: Int, currentTickId: Long): TradeResult
+
+// 2. 玩家向城邦买入物资结算
+fun buy(cityId: Long, item: String, amount: Int, currentTickId: Long): TradeResult
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **城邦信誉封锁红线 (Suspended City-State Redline)**：
+   一旦城邦的 `isSuspended` 标记为 `true`，**任何 sell 或 buy 调用必须被秒拦截**，立即返回 `TradeResult(success = false, actualAmount = 0, goldEarned = 0, ... message = "城邦已暂停与大人的一切交易！")`，绝对防止违规进出口。
+2. **禁止出现负数金币与越权超卖**：实际交易量必须受城邦库存及最大容量 maxCapacity 精准限制。
+
+### 机械式步骤指令：
+1. **实现卖出结算 (`sell`)**：
+   - 步骤 A：定位城邦。若不存在返回 `TradeResult(false, 0, 0, ...)`。
+   - 步骤 B：封锁校验。若 `city.isSuspended == true`，立即返回交易失败。
+   - 步骤 C：**可容纳成交量计算**：
+     - 城邦当前该物资库存为 $Inv_{current}$。由于不能超过容量上限：
+       $$\text{actual} = \min(amount, \text{maxCapacity} - Inv_{current})$$
+     - 若 $actual \le 0$，代表城邦仓库爆满，直接返回交易失败，并提示“城邦该物资已满仓，拒绝买入”。
+   - 步骤 D：价格换算。调用 `getPriceInfo` 获得当前无惩罚单价 $P_{unit}$。
+   - 步骤 E：**倾销惩罚核对与执行**：
+     - 调用 `willTriggerDumping(cityId, item, actual, currentTickId)` 预判。
+     - 若触发倾销：单价价格额外打七折：$P_{final} = P_{unit} \times 0.7f$。并调用私有方法 `applyDumpingPenalty(city, item)`。
+     - 若未触发：单价为 $P_{final} = P_{unit}$。
+   - 步骤 F：**资源写回与流水存盘**：
+     - 城邦库存累加：`city.inventory[item] = Inv_{current} + actual`。
+     - 将本次卖出打包为 `TradeRecord(currentTickId, item, actual, TradeDirection.SELL)` 存入 `city.tradeHistory`。
+     - 计算玩家实际所得金币（正数）：$G_{earned} = (P_{final} \times actual).toInt()$。
+     - 返回包含 $G_{earned}$ 的成功 `TradeResult`。
+2. **实现买入结算 (`buy`)**：
+   - 步骤 A：定位城邦。检查 `isSuspended` 状态。
+   - 步骤 B：**库存量最大可买量计算**：
+     - 根据城邦当前真实库存量：$\text{actual} = \min(amount, Inv_{current})$。
+     - 若 $actual \le 0$，直接返回失败，并提示“城邦该物资已经无货，拒绝卖出”。
+   - 步骤 C：查价换算。由于买入交易不触发信誉惩罚或倾销，此处买入单价 $P_{buy}$ 计算时：
+     - **信誉惩罚隔离**：在调用 getPriceInfo 的计算体系中，买入方不享受“压低 10%”的卖方特权，直接按信誉修正系数为 `1.0f` 进行原价结算（即除以 reputation 惩罚因子还原，或原价计算）。
+   - 步骤 D：资源写回与流水存盘：
+     - 扣减城邦库存：`city.inventory[item] = Inv_{current} - actual`。
+     - 存入流水：`TradeRecord(currentTickId, item, -actual, TradeDirection.BUY)`。
+     - 计算玩家支付金币（金币增量为负数）：$G_{cost} = - (P_{buy} \times actual).toInt()$。
+     - 返回 `TradeResult(success = true, actualAmount = actual, goldEarned = G_{cost}, ...)`。
+
+---
+
+## MDU 7.4-TEST: 进出口物理交易结算与封锁拦截黑盒测试
+
+编写单元测试 `MarketEngineExecutionTest.kt`。
+
+### 机械式测试用例：
+1. **卖出仓库容量爆满限幅拦截测试**：
+   - 注册容量 1000 的城邦，当前库存有 `995` 个木材。
+   - 玩家尝试调用 `sell(cityId = 1, item = "WOOD", amount = 20, currentTickId = 10)`（试图卖 20 个）。
+   - **断言 1**：交易成功（返回 `true`），但 `actualAmount`（实际成交）精准等于 `5`。
+   - **断言 2**：城邦库存增为 `1000` 触顶，且玩家仅获得了 5 个木材对应的金币。
+   - 再次调用 `sell(1, "WOOD", 5, 10)`，断言返回 `false`（爆满直接拒绝）。
+2. **买入库存不足截断测试**：
+   - 设定城邦的 `"FOOD"` 库存为 `3` 个。
+   - 玩家尝试调用 `buy(cityId = 1, item = "FOOD", amount = 10, currentTickId = 10)`（试图买 10 个）。
+   - **断言 1**：交易成功，但 `actualAmount` 被物理截断为 `3`。
+   - **断言 2**：城邦库存降为 `0`，玩家支付 3 个食物的金币。
+3. **倾销扣减惩罚单价与信誉测试**：
+   - 在通畅环境下，调用一次性卖出 `250`（超 20% 限幅，触发倾销）。
+   - **断言 1**：返回回执中的 `dumpingPenaltyApplied` 严格为 `true`。
+   - **断言 2**：`penaltyPriceMultiplier` 严格为 `0.7f`，且金币精准打折。
+   - **断言 3**：城邦快照中玩家信誉被物理扣减了 `0.2`。
+4. **信誉封锁交易拒绝测试**：
+   - 将城邦信誉调到 `-0.4f`（此时 `isSuspended` 自动锁死为 `true`）。
+   - 尝试调用 `sell`。
+   - **断言**：交易失败（返回 `false`），成交量为 0，仓库库存保持不变。
+
+### 交付物：
+只包含 `sell` 和 `buy` 动态计算方法的实现、真实可交易量公式拦截、交易流水写入、及物理买卖及超载封锁 JUnit 测试代码。不含日常自然消耗与 forecast 预测逻辑。

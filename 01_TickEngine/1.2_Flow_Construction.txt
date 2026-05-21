@@ -1,0 +1,251 @@
+## 任务目标
+
+在 MDU 1.1 骨架的基础上，为 `TickEngine` 声明双轨事件广播流，并在独立后台协程循环中以固定 50ms 间隔发射 UI 高频心跳信号。
+
+**输出标准**：代码必须通过 Kotlin 编译，两条 Flow 均使用 `DROP_OLDEST` 背压策略，测试在虚拟时间下稳定通过。
+
+---
+
+## 1. 双轨事件流契约（不可更改）
+
+### 1.1 流声明
+
+```kotlin
+// 逻辑时钟广播流（变速，发射 TickEvent 快照）
+val tickFlow: SharedFlow<TickEvent>
+
+// UI 高频固定 50ms 心跳流（发射当前毫秒时间戳）
+val realTickFlow: SharedFlow<Long>
+1.2 流特征说明
+tickFlow：
+
+数据类型：TickEvent
+发射频率：变速（由 intervalMs 控制）
+用途：游戏逻辑同步
+
+realTickFlow：
+
+数据类型：Long（时间戳）
+发射频率：固定 50ms
+用途：UI 高频心跳指示器
+
+2. 流实现与背压策略
+2.1 MutableSharedFlow 声明（含背压配置）
+kotlin复制class TickEngine(private val scope: CoroutineScope) {
+
+    // 逻辑时钟流：replay=0 表示不重放历史，DROP_OLDEST 防止背压阻塞
+    private val _tickFlow = MutableSharedFlow<TickEvent>(
+        replay = 0,
+        extraBufferCapacity = 1,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val tickFlow: SharedFlow<TickEvent> = _tickFlow.asSharedFlow()
+
+    // UI 高频心跳流：同上策略
+    private val _realTickFlow = MutableSharedFlow<Long>(
+        replay = 0,
+        extraBufferCapacity = 1,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val realTickFlow: SharedFlow<Long> = _realTickFlow.asSharedFlow()
+
+    // 协程任务句柄
+    private var engineJob: Job? = null
+
+    // ... 其他 MDU 1.1 内容（原子变量、API 骨架）
+}
+2.2 背压策略说明（重要）
+SUSPEND：
+
+行为：缓冲区满时发射端挂起等待
+本模块要求：❌ 禁止使用
+
+DROP_OLDEST：
+
+行为：缓冲区满时丢弃最老的事件
+本模块要求：✅ 必须使用
+
+DROP_LATEST：
+
+行为：缓冲区满时丢弃最新的发射
+本模块要求：❌ 禁止使用
+
+⚠️ 禁止使用 SUSPEND 策略：若 UI 层消费缓慢导致积压，引擎后台协程绝不能因此挂起暂停，防止时钟心跳因 UI 慢消费而卡死。
+3. start() 协程循环实现
+3.1 完整 start() 签名与行为
+```kotlin
+fun start(initialTick: Long = 0) {
+    startMutex.withLock {
+        // 1. 清理旧资源（通过内部无锁方法调用）
+        stopInternal()
+
+        // 2. 初始化双标志位与起点
+        currentTickId.set(initialTick)
+        accumulator = 0L // 累加器归零
+        isEnginePaused.set(false)
+        isLogicPaused.set(false)
+
+        // 3. 启动后台循环协程
+        engineJob = scope.launch {
+            while (isActive) {
+                delay(50L) // 在循环顶部 delay
+                if (!isEnginePaused.get()) {
+                    _realTickFlow.tryEmit(System.currentTimeMillis())
+                }
+            }
+        }
+    }
+}
+```
+3.2 行为约束
+
+固定节拍：delay(50L) 在循环顶部，确保每个心跳间隔精确为 50ms
+暂停穿透：当 isEnginePaused == true 时，realTickFlow 不发射，但协程不停止
+tryEmit 非阻塞：tryEmit 立即返回成功/失败，不阻塞发射协程
+isActive 检查：循环终止条件，防止僵尸协程
+
+## 4. stop() 协程停止实现
+
+### 4.1 完整 stop() 签名与行为
+
+```kotlin
+fun stop() {
+    startMutex.withLock {
+        stopInternal()
+    }
+}
+
+private fun stopInternal() {
+    // 1. 取消当前运行的协程
+    engineJob?.cancel()
+    engineJob = null
+
+    // 2. 双标志位强制归零
+    isEnginePaused.set(false)
+    isLogicPaused.set(false)
+}```
+4.2 行为约束
+
+engineJob 为 null 时调用 stop() 应无操作（幂等）
+取消协程后，realTickFlow 不会再发射新事件
+已订阅但未消费的 Collector 不受取消影响（SharedFlow 生命周期独立）
+
+5. 禁止事项（硬性约束）
+
+背压策略红线：onBufferOverflow 必须为 BufferOverflow.DROP_OLDEST，禁止 SUSPEND
+UI 心跳纯度红线：realTickFlow 只携带 Long（毫秒时间戳），禁止携带 TickEvent 或任何业务逻辑数据
+无逻辑心跳发射：本模块只负责 50ms 节拍发射，不涉及 tickFlow 的 TickEvent 发射逻辑（属于 MDU 1.4）
+
+6. MDU 1.2 测试规范：TickEngineFlowTest.kt
+6.1 虚拟时间陷阱说明（必读）
+⚠️ 测试架构关键规则：
+由于 replay = 0，Flow 在订阅前发射的事件会丢失。在 kotlinx-coroutines-test 中使用 advanceTimeBy() 时：
+
+错误顺序：start() → advanceTimeBy(250) → 再订阅（数据已丢失）
+正确顺序：先订阅（挂起等待）→ start() → advanceTimeBy(250)
+
+本模块所有测试必须采用先订阅再触发的时间线，否则测试 Flaky。
+6.2 测试用例
+
+T01：高频 UI 心跳步进事件数验证
+
+目的：验证 250ms 虚拟时间内精确发射 5 次心跳
+步骤：
+
+创建结果列表：val results = mutableListOf<Long>()
+先订阅（关键！）：val job = scope.launch { realTickFlow.toList(results) }
+调用 start()
+调用 advanceTimeBy(250)（推进虚拟时间 250ms）
+取消Collector：job.cancelAndJoin()
+
+
+断言：
+
+- A1：`results.size >= 5`（250ms / 50ms = 5，实际可能 5 或 6）
+- A2：不再校验 `results` 中相邻时间戳的差值（因 `System.currentTimeMillis()` 随真实时间流逝，虚拟时间内无法得到 50ms 的间隔，仅校验心跳数量即证明循环正常运行）
+
+
+通过标准：捕获心跳数达到预期
+
+T02：暂停时心跳不发射验证
+
+目的：验证 pauseEngine() 后 realTickFlow 停止发射
+步骤：
+
+先订阅：val results = mutableListOf<Long>(); val job = scope.launch { realTickFlow.toList(results) }
+调用 start()
+调用 advanceTimeBy(100) → 预期至少 2 次心跳
+调用 pauseEngine()
+调用 advanceTimeBy(200) → 预期 0 次心跳
+调用 resumeEngine()
+调用 advanceTimeBy(100) → 预期至少 2 次心跳
+
+
+断言：
+
+步骤3后 results.size >= 2
+步骤5后 results.size 无变化
+步骤7后 results.size 继续增长
+
+
+通过标准：暂停/恢复语义正确穿透到 realTickFlow
+
+T03：stop() 终止心跳验证
+
+目的：验证 stop() 后不再发射新心跳
+步骤：
+
+先订阅：val results = mutableListOf<Long>(); val job = scope.launch { realTickFlow.toList(results) }
+调用 start()
+调用 advanceTimeBy(100) → 预期至少 2 次心跳
+调用 stop()
+调用 advanceTimeBy(200) → 预期 0 次心跳
+
+
+断言：
+
+步骤3后 results.size >= 2
+步骤5后 results.size 无变化
+
+
+通过标准：stop() 正确终止心跳循环
+
+7. 测试框架要求
+
+使用 kotlinx.coroutines.test.TestScope 或 TestCoroutineScope
+使用 kotlin.test 断言库
+每个测试方法独立，无执行顺序依赖
+禁止使用反射访问私有字段（黑盒测试原则）
+
+8. 输出要求
+
+仅输出 Kotlin 代码文件（TickEngine.kt 更新 + TickEngineFlowTest.kt）
+包含：两条 SharedFlow 声明、50ms 心跳循环、stop() 协程取消逻辑
+不包含：tickFlow 的 TickEvent 发射逻辑、时段换算、Mutex 互斥启动逻辑
+代码格式：遵循 Kotlin 官方约定，标注 visibility modifier
+
+9. 快速行为查阅
+启动时序：
+code复制start()
+  → engineJob = scope.launch { while(isActive) { delay(50L); if(!isEnginePaused) _realTickFlow.tryEmit(now) } }
+  → 立即返回，不阻塞
+暂停时序：
+code复制pauseEngine()
+  → isEnginePaused.set(true)
+  → 循环检测到 true，tryEmit 跳过，但协程继续运行（不退出）
+恢复时序：
+code复制resumeEngine()
+  → isEnginePaused.set(false)
+  → 下一周期检测到 false，恢复 tryEmit
+停止时序：
+code复制stop()
+  → engineJob?.cancel()
+  → engineJob = null
+  → 循环终止，realTickFlow 不再发射
+10. 与 MDU 1.1 的边界说明
+TimePeriod 枚举、TickEvent 数据类：MDU 1.1
+AtomicLong/Boolean 原子变量：MDU 1.1
+公开 API 骨架（start/stop/pause/resume…）：MDU 1.1
+双轨 SharedFlow 声明 + 背压策略：MDU 1.2
+50ms UI 心跳循环 + tryEmit：MDU 1.2
+tickFlow 的 TickEvent 发射逻辑：MDU 1.4（下一模块）

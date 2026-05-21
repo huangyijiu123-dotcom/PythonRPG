@@ -1,0 +1,211 @@
+MDU 1.1: TickEngine 状态容器与公开 API 声明
+任务目标
+为 TickEngine 定义完整的时段枚举、心跳事件数据模型、骨架类及全部原子状态容器与公开 API 签名，并提供初始状态的黑盒行为验证代码。
+输出标准：代码必须通过 Kotlin 编译，原子变量使用 Atomic* 类型，API 签名与下方契约完全一致。
+1. 核心数据模型（不可更改字段名与类型）
+在同一文件内定义以下类型：
+kotlin复制enum class TimePeriod {
+    MORNING,    // tickId % 24 == 1
+    DAYTIME,    // tickId % 24 in 2..14
+    TWILIGHT,   // tickId % 24 in 15..16
+    NIGHT       // tickId % 24 in 17..23 或 == 0
+}
+
+data class TickEvent(
+    val tickId: Long,
+    val timestamp: Long,
+    val timeOfDay: TimePeriod
+)
+时段判定规则：
+
+MORNING：tickId % 24 == 1
+DAYTIME：tickId % 24 in 2…14
+TWILIGHT：tickId % 24 in 15…16
+NIGHT：tickId % 24 in 17…23 或 == 0（含初始状态 tickId=0）
+
+2. 类骨架与原子状态变量
+2.1 骨架声明
+kotlin复制class TickEngine(private val scope: CoroutineScope) {
+    // 原子状态变量（见 2.2）
+    // 公开 API（见 3）
+    // 禁止：Flow 声明、协程 launch、GameTick 累加逻辑
+}
+2.2 原子状态变量（必须使用 Atomic 类型）
+
+currentTickId：AtomicLong，默认 0L，当前逻辑 Tick ID
+intervalMs：AtomicLong，默认 5000L，单个逻辑 Tick 间隔（毫秒）
+isEnginePaused：AtomicBoolean，默认 false，引擎全停标志（手动暂停）
+isLogicPaused：AtomicBoolean，默认 false，逻辑停摆标志（晨会冻结）
+
+2.3 协程内部变量（非原子，单线程访问）
+  
+`accumulator`: `private var accumulator: Long = 0L`，记录自上一逻辑 Tick 以来累积的毫秒数。
+  - 该变量仅在 `engineJob` 协程内部或受 `startMutex` 保护的方法（如 `start`）中访问，无需 `Atomic` 包装。
+  - 每次调用 start() 时必须在 startMutex.withLock 内显式重置为 0L（见 MDU 1.4）。
+  - 暂停期间（isLogicPaused=true）继续累加，不得重置（避免恢复后额外等待）。
+
+2.3 协程锁
+kotlin复制private val startMutex = Mutex()
+3. 公开 API 详细行为说明
+3.1 start(initialTick: Long = 0)
+签名：fun start(initialTick: Long = 0)
+功能：初始化并启动 TickEngine，将 currentTickId 设置为 initialTick 值，开始计时心跳。
+行为约束：
+
+initialTick 允许任意非负整数，默认为 0
+必须使用 startMutex 确保同一时刻只有一个启动操作在执行
+若引擎已处于运行状态，调用此方法应无操作（幂等性）
+启动成功后，isEnginePaused 必须保持 false
+
+初始状态：
+
+currentTickId 被设置为传入的 initialTick 值
+intervalMs 保持默认值 5000L
+isEnginePaused 为 false
+isLogicPaused 为 false
+
+返回值：Unit
+3.2 stop()
+签名：fun stop()
+功能：停止 TickEngine，清除所有运行时状态，释放资源。
+行为约束：
+
+调用后引擎进入停止状态，currentTickId 保持当前值不变（不清零）
+isEnginePaused 设为 false
+isLogicPaused 设为 false
+已暂停状态全部解除
+后续可再次调用 start() 重新启动
+
+返回值：Unit
+3.3 pauseEngine()
+签名：fun pauseEngine()
+功能：玩家手动暂停，触发双轨全停。
+行为约束：
+
+设置 isEnginePaused = true
+不修改 isLogicPaused 的状态（保持原样）
+无论引擎当前是否已在运行，均可调用
+若引擎已暂停，调用此方法应无操作
+
+返回值：Unit
+3.4 resumeEngine()
+签名：fun resumeEngine()
+功能：玩家手动恢复，解除全停。
+行为约束：
+
+设置 isEnginePaused = false
+不修改 isLogicPaused 的状态（保持原样）
+恢复后引擎从当前 currentTickId 继续运行
+若引擎未处于暂停状态，调用此方法应无操作
+
+⚠️ 晨会状态交互说明：
+resumeEngine() 实行"仅解除手动暂停、保留晨会冻结"的语义。
+场景示例：晨会冻结中（isLogicPaused=true, isEnginePaused=false），玩家调用 pauseEngine() 后，系统全停。
+之后再调用 resumeEngine()，系统解除手动全停，但晨会冻结状态将被保留，逻辑心跳依然冻结。
+
+返回值：Unit
+
+3.5 pauseLogic()
+签名：fun pauseLogic()
+功能：晨会时间冻结，仅暂停逻辑 GameTick。
+行为约束：
+
+设置 isLogicPaused = true
+不影响 isEnginePaused（引擎可仍在运行）
+UI 高频心跳（realTickFlow）不受影响，继续照常发射
+若逻辑已暂停，调用此方法应无操作
+
+典型场景：晨会期间，玩家仍在 UI 上看到心跳更新，但游戏逻辑冻结。
+返回值：Unit
+3.6 resumeLogic()
+签名：fun resumeLogic()
+功能：晨会结束，恢复逻辑 GameTick。
+行为约束：
+
+设置 isLogicPaused = false
+若逻辑未处于暂停状态，调用此方法应无操作
+不影响 isEnginePaused
+
+返回值：Unit
+3.7 setGameSpeed(newIntervalMs: Long)
+签名：fun setGameSpeed(newIntervalMs: Long)
+功能：调整游戏时间速度，即修改每个逻辑 Tick 的时间间隔。
+行为约束：
+
+newIntervalMs 必须为正整数（> 0）
+传入非正值时应忽略，保持当前 intervalMs 不变
+立即生效，无需重启引擎
+设置后不影响已发射的 TickEvent，只影响后续心跳
+
+示例：
+
+setGameSpeed(2000L) → 每 2 秒一个逻辑 Tick（加速）
+setGameSpeed(10000L) → 每 10 秒一个逻辑 Tick（减速）
+setGameSpeed(0L) → 无操作
+
+返回值：Unit
+3.8 isEnginePaused(): Boolean
+签名：fun isEnginePaused(): Boolean
+返回值：
+
+true：引擎已手动暂停，双轨均停止
+false：引擎正常运行，或仅逻辑暂停
+
+3.9 isLogicPaused(): Boolean
+签名：fun isLogicPaused(): Boolean
+返回值：
+
+true：逻辑心跳已暂停（晨会冻结）
+false：逻辑心跳正常运行
+
+与 isEnginePaused() 的组合语义：
+
+isEnginePaused=false, isLogicPaused=false → 全速运行
+isEnginePaused=false, isLogicPaused=true → 仅逻辑暂停（晨会）
+isEnginePaused=true, isLogicPaused=任意 → 双轨全停（手动暂停优先级最高）
+
+3.10 getCurrentTickId(): Long
+签名：fun getCurrentTickId(): Long
+返回值：
+
+引擎启动后：返回自 start(initialTick) 以来的当前 tick 计数
+引擎未启动时：返回初始值 0L
+
+4. 双轨暂停语义总览
+pauseEngine()：玩家手动暂停，双轨全停，isEnginePaused=true，不改变 isLogicPaused
+resumeEngine()：解除手动暂停，isEnginePaused=false，不改变 isLogicPaused
+pauseLogic()：晨会冻结，仅逻辑停，isLogicPaused=true，UI 心跳继续
+resumeLogic()：晨会结束，逻辑恢复，isLogicPaused=false
+⚠️ 下游模块引用接口时，必须使用上述命名，禁止使用旧名称（pause、pauseGameTick 等）。
+5. 禁止事项（硬性约束）
+
+原子类型强制：所有内部运行状态必须使用 Atomic* 类型，禁止 var 普通变量持有引擎状态
+无业务逻辑：禁止在此模块实现任何 Flow 发射或 scope.launch 协程逻辑
+黑盒测试：单元测试禁止使用反射或访问私有字段
+
+6. 初始状态黑盒测试：TickEngineStateTest.kt
+测试用例：
+T01：实例化 TickEngine，注入 TestCoroutineScope，对象创建成功，无异常
+T02：调用 getCurrentTickId()，必须等于 0L
+T03：调用 isEnginePaused()，必须等于 false
+T04：调用 isLogicPaused()，必须等于 false
+T05：调用后无副作用，intervalMs 隐式为 5000L
+T06：任何测试中不得出现 java.lang.reflect.* 或反射调用
+通过标准：
+
+所有用例断言通过 → 测试通过
+任一断言失败 → 报告具体 API 名称、期望值、实际值
+发现反射调用 → 测试失败，报错 “黑盒测试违规：禁止反射访问私有字段”
+
+测试框架要求：
+
+使用 kotlinx.coroutines.test.TestCoroutineScope
+使用 kotlin.test 或 junit5 断言库
+每个用例为独立测试方法，无执行顺序依赖
+
+输出要求
+
+仅输出 Kotlin 代码文件（TickEngine.kt + TickEngineStateTest.kt）
+不输出：Flow 声明、协程 launch、GameTick 累加逻辑
+代码格式：遵循 Kotlin 官方约定，标注 visibility modifier（private / public）
+测试覆盖：至少包含上表中的 6 个测试用例

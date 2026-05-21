@@ -1,0 +1,87 @@
+# MDU 16.3: 时序倒计时老化与系数乘法叠叠乐 (MDU-C: Modifiers & Progression)
+
+作为 AI 全局法令与状态控制专家，你的任务是为法令系统打通时钟心跳自减老化逻辑，并在多法令同时生效时，将其环境修正乘数以纯粹的代数乘法叠乘后输出，暴露给外部模块进行全局数值结算。
+
+---
+
+## 1. 进度老化与乘数叠乘契约 (Modifiers & Tick Contract)
+
+在法令引擎中声明并实现时钟时序推进以及动态乘数拉取 API（确保级联乘法在并发下的精度无损）：
+
+```kotlin
+// 外部中央循环在每 Tick 推进时主动调用，自减滚动所有 ACTIVE 和 COOLDOWN 的法令时间倒计时
+fun processTick()
+
+// 汇总提取当前领地所有处于 ACTIVE 生效态的法令修正系数
+// 汇总规则：初始基础值均为 1.0f，多条活跃法令影响同一因子时，以乘法叠乘
+fun getModifiers(): PolicyModifiers
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **法令叠乘累加运算红线 (Multiplication Multiplier Redline)**：
+   多项政策叠加影响同一个全局修正因子（例如“全民皆兵”产量乘数 0.7f，“狂热采集”产量乘数 1.3f）时，**引擎只允许采用叠乘运算**：
+   $$\text{综合产量系数} = 1.0f \times 0.7f \times 1.3f = 0.91f$$
+   绝对禁止使用累加公式（如 $1.0 - 0.3 + 0.3 = 1.0$）造成系数精度飘逸失衡，捍卫多重决策冲突下的数值自洽。
+2. **禁止静默老化**：当 ACTIVE 到期的一瞬间，必须强制流转回 COOLDOWN 冷静期并重新设定冷却时长。
+
+### 机械式步骤指令：
+1. **时序推进倒计时老化算法实现 (`processTick`)**：
+   - 遍历 `policies.values` 副本：
+     - **状态分支 1**：若 `snap.state == PolicyState.ACTIVE`：
+       - 自减：`snap.remainingTicks -= 1`。
+       - **生效到期流转**：若 `snap.remainingTicks <= 0`：
+         - 提取配置：`val config = configs[snap.type] ?: return`。
+         - 流转：`snap.state = PolicyState.COOLDOWN`，`snap.remainingTicks = config.cooldownTicks`（物理强制进入冷却期）。
+     - **状态分支 2**：若 `snap.state == PolicyState.COOLDOWN`：
+       - 自减：`snap.remainingTicks -= 1`。
+       - **冷却到期流转**：若 `snap.remainingTicks <= 0`：
+         - 恢复：`snap.state = PolicyState.INACTIVE`，`snap.remainingTicks = 0`（完全归零，可以重新颁布）。
+2. **系数级联叠乘算法实现 (`getModifiers`)**：
+   - 步骤 A：提取所有活跃法令：`val activeSnaps = policies.values.filter { it.state == PolicyState.ACTIVE }`。
+   - 步骤 B：**使用 `fold` 叠乘汇总（以默认 1.0f 基底的 `PolicyModifiers()` 为初始值）**：
+     ```kotlin
+     return activeSnaps.fold(PolicyModifiers()) { acc, snap ->
+         val cfg = configs[snap.type] ?: return@fold acc
+         acc.copy(
+             foodConsumptionMultiplier = acc.foodConsumptionMultiplier * cfg.modifiers.foodConsumptionMultiplier,
+             energyRestoreMultiplier   = acc.energyRestoreMultiplier   * cfg.modifiers.energyRestoreMultiplier,
+             combatAttackMultiplier    = acc.combatAttackMultiplier    * cfg.modifiers.combatAttackMultiplier,
+             harvestYieldMultiplier    = acc.harvestYieldMultiplier    * cfg.modifiers.harvestYieldMultiplier,
+             caravanSpeedMultiplier    = acc.caravanSpeedMultiplier    * cfg.modifiers.caravanSpeedMultiplier,
+             tradeProfitMultiplier     = acc.tradeProfitMultiplier     * cfg.modifiers.tradeProfitMultiplier,
+             energyCostMultiplier      = acc.energyCostMultiplier      * cfg.modifiers.energyCostMultiplier,
+             upgradeCostMultiplier     = acc.upgradeCostMultiplier     * cfg.modifiers.upgradeCostMultiplier,
+             techCostMultiplier        = acc.techCostMultiplier        * cfg.modifiers.techCostMultiplier,
+             buildingDefenseMultiplier = acc.buildingDefenseMultiplier * cfg.modifiers.buildingDefenseMultiplier,
+             moveSpeedMultiplier       = acc.moveSpeedMultiplier       * cfg.modifiers.moveSpeedMultiplier
+         )
+     }
+     ```
+   *此方案直接利用 `PolicyModifiers` 默认参数全为 1.0f 的特性作为基底，通过 `copy()` 逿轨叠乘每一法令的修正系数。这防止了单独存在的 11 个分散变量导致的遗漏风险。1个字段名写错也不会编译通过，级联叠乘数值精度完全与手动法一致。*
+
+---
+
+## MDU 16.3-TEST: 时序到期自转、冷却完工与环境系数乘法叠乘测试
+
+编写单元测试 `PolicyProgressionAndModifiersTest.kt`。
+
+### 机械式测试用例：
+1. **时序老化到期自转冷却测试**：
+   - 注入一个处于 `ACTIVE` 的 `RATIONING` 口粮配给制法令（配置持续为 8 Ticks，冷却为 2）。
+   - 连续调用 8 次 `processTick()`。
+   - **断言 1**：在第 8 次 Tick 的瞬间，状态流转为 `PolicyState.COOLDOWN`，倒计时 `remainingTicks` 刷新为冷却值 `2`。
+   - 再连续调用 2 次 `processTick()`。
+   - **断言 2**：在冷却到期时，法令状态回滚重写为了 `PolicyState.INACTIVE`，计时器归零（表明下一次研究通道重新开通）。
+2. **多法令重叠系数纯粹叠乘测试**：
+   - 往容器直接注入两个处于 `ACTIVE` 生效的法令：
+     - 全民皆兵 `MOBILIZATION`（产量系数 0.7f）。
+     - 狂热采集 `FRANTIC_GATHERING`（产量系数 1.3f）。
+   - 调用 `getModifiers()` 汇总。
+   - **断言**：提取 `harvestYieldMultiplier`，其汇总出的最终系数必须为 $1.0f \times 0.7f \times 1.3f = 0.91f$（精度浮点防飘逸断言通过）。
+
+### 交付物：
+只包含 `processTick` 心跳计时流转、`getModifiers` 代数级联叠乘算法、以及时序老化和系数叠乘的 JUnit 单元测试代码。不含任何金币扣减及颁布上限拦截逻辑。

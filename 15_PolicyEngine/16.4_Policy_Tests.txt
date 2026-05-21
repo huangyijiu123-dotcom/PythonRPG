@@ -1,0 +1,49 @@
+# MDU 16.4: 执政政策混合流转与高并发政策变迁压测 (MDU-D: High-Concurrency Stress Tests)
+
+作为 AI 全局法令与状态控制专家，你的任务是为法令系统设计全流程时序流转与高频并发操作下的“无锁死线程一致性防脏读压测断言”。
+
+---
+
+## MDU 16.4-TEST: 全生命周期自洽流转与多线程政策混战压测
+
+编写单元测试 `PolicyConcurrencyAndStressTest.kt`。
+
+---
+
+## 1. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **并发脏读崩溃红线 (No Concurrent Modification Redline)**：
+   在多协程混合读写下，**绝对禁止因为 ConcurrentHashMap 遍历产生任何 ConcurrentModificationException 报错**！在 getModifiers 进行全列表快照乘法叠乘的同时，前台必须允许高频并发开关新政策或 processTick 倒计时衰减，捍卫全局 GameLoop 高帧运行。
+2. **禁止任何粗粒度 synchronized 重量级阻塞锁**。
+
+### 机械式步骤指令与用例设计：
+1. **执政政策完全生命周期流变闭环测试**：
+   - 步骤 A：开局初始：口粮配给 `RATIONING` 状态为 `INACTIVE`。
+   - 步骤 B：金币质押 30，调用 `enactPolicy(RATIONING, true)`。
+   - **断言 1**：成功进入 `ACTIVE`，剩余生效倒计时 `remainingTicks` 锁定为 8。
+   - 步骤 C：连续调用 8 次 `processTick()` 心跳老化。
+   - **断言 2**：在第 8 次 Tick 的一瞬间，状态自动跳变，物理进入冷静期 `COOLDOWN`，倒计时重设为 2。
+   - 步骤 D：连续调用 2 次 `processTick()` 解除冷静。
+   - **断言 3**：冷静期满，法令状态温和重写变回 `INACTIVE`，`remainingTicks` 归零，圆满闭环！
+2. **多线程政策变迁与叠乘高频轰炸无死锁压测**：
+   - 实例化 `PolicyEngine` 并设定上限 `getMaxActivePolicies()` 为 3。
+   - 启动 50 个高并发协程 Workers 并发混战：
+     - 20 个协程疯狂调用 `processTick()` 进行全局法令时钟老化。
+     - 20 个协程随时呼叫 `getModifiers()` 被动拉取叠乘环境系数，进行高频只读遍历。
+     - 10 个协程交错随机执行 `enactPolicy(type, true)` 开启或 `enactPolicy(type, false)` 强制撤单废除。
+   - **断言**：高并发混战运行 2000 轮以上，容器状态高度一致自洽，未爆任何 ConcurrentModificationException 异常，未发生任何死锁卡死挂起。
+
+---
+
+## 🔒 语义级冻结声明 (Semantic-Level Freeze Declaration)
+
+当本 MDU 及其配套测试完全通过后，`PolicyEngine` 核心语义冻结。
+
+### 冻结语义边界：
+1. **6大法令参数绝对锁定**：商业开放（持续10/耗费80/冷却2）、狂热采集（持续6/耗费40/冷却2）等金币消耗与生效时长终生静态固定。
+2. **系数代数叠乘锁定**：多种政策交叉影响同一全局乘数时必须执行 `*` 叠乘，禁止采用加减。
+3. **主动废除不退款**：废除法令金币零退还，瞬间强行滚入冷却期。
+
+### 允许进化范围 (Permitted Evolutions)：
+- 允许后续新增执政方针（如“税收减免”或“全民动员”），但新法令在开闭、多槽位上限限制、时钟老化以及叠乘系数暴露方面，必须完全符合本模块的 Lifecycle 设计。

@@ -1,0 +1,66 @@
+# MDU 11.4: 协程高并发大面积天灾碰撞与去重广播测试 (MDU-D: High Concurrency & Stress Tests)
+
+作为 AI 突发随机事件调度专家，你的任务是为事件管理器设计高密度协程压榨下的“天灾碰撞与去重广播稳定性回归契约”，验证多线程抢修与老化流转时，引擎字典的线程安全无锁极限表现。
+
+---
+
+## 1. 核心高并发与去重回归契约 (Stress & Concurrency Contract)
+
+本 MDU 为纯并发压测与去重广播稳定性回归校验层，对多重高频天灾调度进行强硬限幅断言：
+
+```kotlin
+// 并发熔断规范：
+// 在多线程高频触发 tryTriggerEvents() 时，任何去重防叠事件（如 COLD_SNAP、BOSS_RIOT）
+// 必须严格在整个 ConcurrentHashMap 存活期内有且仅有一个实例，绝对不能因并发时序产生分裂或重合。
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **并发修改与脏读红线 (Concurrent Thread-Safe Redline)**：
+   在外部 ActionProcessor 多线程并发执行扑救调用 `resolveEvent(eventId)`，而主时钟同时在另一条线程并发递推 `processTick(tickId)` 时，**绝对禁止引入阻塞型重量级互斥锁**！全部状态读写必须基于 Kotlin 并发安全的 ConcurrentHashMap 及原子计数器，排除主时钟挂起风险。
+2. **禁止广播丢失溢出**：SharedFlow 必须能够无阻塞容纳大量高频 SPAWNED/RESOLVED 广播，不发生事件丢失。
+
+### 机械式步骤指令：
+1. **多线程并发扑救与老化混合测试**：
+   - 步骤 A：在一个并发用例中，启动 40 个并发协程。
+   - 步骤 B：一半协程疯狂模拟时序滚动：高频并发调用 `processTick(tickId)`，诱发各种天灾概率出生与到期老化。
+   - 步骤 C：另一半协程高频获取 `getActiveEvents()` 提取活跃列表，并并发调度 `resolveEvent(eventId)` 疯狂扑救。
+   - 步骤 D：**并发零崩溃断言**：运行足够周期，**断言全程未出现任何 ConcurrentModificationException**，证明 ConcurrentHashMap 及 SharedFlow 原子广播极佳的并发韧性。
+2. **多线程高频 COLD_SNAP/BOSS_RIOT 去重防叠物理断言**：
+   - Mock 状态：强行锁定天气为 `"COLD_WAVE"`。
+   - 启动 20 个协程同时疯狂执行 `tryTriggerEvents()`。
+   - **防御性断言**：高并发混战后，活跃列表中 `COLD_SNAP` 突袭事件的数量**必须精准等于 1**，物理去重锁表现强硬，防叠成功。
+
+---
+
+## MDU 11.4-TEST: 协程天灾压榨与去重广播防叠回归测试
+
+编写单元测试 `EventEngineStressTest.kt`。
+
+### 机械式测试用例：
+1. **天灾极限并发混战零崩溃测试**：
+   - 实例化 `EventEngine`。
+   - 注入 Mock 天气及受灾建筑。
+   - 启动并发读写协程池（100 个并发 Workers）：
+     - 并发推进 tick 并并发调用 `resolveEvent`。
+   - **断言**：压榨轰炸过后，活跃字典结构完好无缺，系统运行依然零阻塞、零异常抛出。
+2. **并发 COLD_SNAP 绝对唯一防裂变断言**：
+   - 在高并发高频触发环境下。
+   - **断言**：检查活跃字典，全天候仅有唯一寒流和唯一 Boss 骚乱事件，彻底粉碎了多重并发流转下的重合 Bug。
+
+---
+
+## 🔒 语义级冻结声明 (Semantic-Level Freeze Declaration)
+
+当本 MDU 及其配套测试完全通过后，`EventEngine` 模块核心语义冻结。
+
+### 冻结语义边界：
+1. **去重物理防叠**：寒流突袭（COLD_SNAP）与 Boss 暴动（BOSS_RIOT）在活跃字典中必须永远强强唯一，任何版本重构绝对不准生出双胞胎。
+2. **无限寿命事件锁定**：`remainingTicks == -1` 的 Boss 骚乱在时序推演中绝对免于倒计时扣减，终生有效。
+3. **环境硬性判定关联**：森林火灾与干旱、洪水与暴雨、寒流与寒潮天气的天候绑定关系绝对锁定。
+
+### 允许进化范围 (Permitted Evolutions)：
+- 允许添加新的天灾突发事件（如“蝗灾”或“大地震”），但新增事件的流转和时序倒计时自损机制必须毫无保留地遵循本模块的 Lifecycle 老化及去重规约。

@@ -1,0 +1,82 @@
+# MDU 16.2: 法令颁布、废除与上限物理拦截器 (MDU-B: Enactment & Restrictions)
+
+作为 AI 全局法令与状态控制专家，你的任务是为执政引擎开发严密的安全准入校验链条，实现法令颁布时的“金币安全扣减”与“激活上限强制阻断”，以及中途撤销废除法令时的“即刻冷却机制”。
+
+---
+
+## 1. 法令颁布与废除控制契约 (Enact & Repeal Contract)
+
+在法令引擎外层声明依赖注入的回调接口，并实现核心的激活/关闭控制 API（保障资源消费的原子安全性）：
+
+```kotlin
+// 法令依赖的外部资源与特权回调接口
+interface PolicyDependencyProvider {
+    // 从玩家仓库中划扣激活法令所需的金币资源（金币足额返回 true，不足返回 false）
+    fun deductGold(amount: Int): Boolean
+
+    // 返回当前领地在当前科技加成下，允许同时激活处于 ACTIVE 的法令数量上限（默认为 2）
+    fun getMaxActivePolicies(): Int
+}
+
+// 激活或关闭某个法令（ isActive=true 为颁布，isActive=false 为废除。返回 true 表示操作成功）
+fun enactPolicy(type: PolicyType, isActive: Boolean): Boolean
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **法令超载颁布红线 (Max Active Policies Redline)**：
+   领地同时激活生效的法令**绝对禁止超出上限**！在调用 `enactPolicy(type, true)` 开启法令时，若当前处于 `PolicyState.ACTIVE` 的法令数量已达到且超过了 `dependencyProvider.getMaxActivePolicies()`，必须立即强力拦截返回 `false`，捍卫科技策略玩法的数值严谨性。
+2. **冷静冷却期抢跑红线 (Cooldown Activation Bypass)**：
+   任何处于 `COOLDOWN`（冷却中）状态的法令，**绝对禁止再次激活**！必须拦截返回 `false`，防范外部脚本高频开闭策略套利。
+
+### 机械式步骤指令：
+1. **实现法令激活安全放置拦截 (`enactPolicy(isActive = true)`)**：
+   - 步骤 A：获取状态：`val snap = policies[type] ?: return false`。
+   - 步骤 B：**冷却及重复激活审查**：
+     - 若 `snap.state != PolicyState.INACTIVE`，强力返回 `false`（防冷却期抢跑、防在研重复颁布）。
+   - 步骤 C：**执政上限物理检查**：
+     - 统计当前生效总数：`val activeCount = policies.values.count { it.state == PolicyState.ACTIVE }`
+     - 若 `activeCount >= dependencyProvider.getMaxActivePolicies()`，强力返回 `false`（触发法令超载拦截）。
+   - 步骤 D：**金币扣减核销**：
+     - 提取配置：`val config = configs[type] ?: return false`。
+     - 调用扣减：`val success = dependencyProvider.deductGold(config.goldCost)`。
+     - 若 `success` 为 `false`，说明大仓库金币不足，强力返回 `false`（缺钱熔断）。
+   - 步骤 E：**流转录入**：
+     - 线程安全修改：`snap.state = PolicyState.ACTIVE`，`snap.remainingTicks = config.durationTicks`。
+     - 返回 `true`。
+2. **实现主动撤销废除与进入冷却 (`enactPolicy(isActive = false)`)**：
+   - 步骤 A：获取状态：`val snap = policies[type] ?: return false`。
+   - 步骤 B：**运行状态审查**：
+     - 若 `snap.state != PolicyState.ACTIVE`，拒绝废除返回 `false`（只有运行中的法令才能被主动撤下）。
+   - 步骤 C：**废除退役，强冷起步**：
+     - 提取配置：`val config = configs[type] ?: return false`。
+     - **不退还金币，且瞬间推入冷静期**：
+       - `snap.state = PolicyState.COOLDOWN`
+       - `snap.remainingTicks = config.cooldownTicks`（设为配置中设定的冷静 Tick，如 2 Ticks）
+     - 返回 `true`。
+
+---
+
+## MDU 16.2-TEST: 法令颁布上限、中途废除与冷却期抢跑拦截测试
+
+编写单元测试 `PolicyEnactValidatorTest.kt`。
+
+### 机械式测试用例：
+1. **法令激活超载上限强力拦截测试**：
+   - Mock 依赖项：最高激活上限 `getMaxActivePolicies()` 精准返回 `2`，金币判定必过。
+   - 连续颁布口粮配给 `enactPolicy(RATIONING, true)`、全民皆兵 `enactPolicy(MOBILIZATION, true)`。
+   - **断言 1**：前两次激活均返回 `true`。
+   - 尝试激活第三个法令商业开放 `enactPolicy(OPEN_TRADE, true)`。
+   - **断言 2**：第三次激活返回 `false`，且商业开放法令依旧稳固为 `INACTIVE` 状态，超限保护成功。
+2. **主动废除进入冷却与抢跑激活拦截测试**：
+   - 颁布 `RATIONING`（消耗 30 金币，冷却 2）。
+   - 呼叫主动废除：`enactPolicy(RATIONING, false)`。
+   - **断言 1**：废除方法返回 `true`，且状态跳变为了 `PolicyState.COOLDOWN`，倒计时 `remainingTicks` 变为冷却时长 `2` Ticks。
+   - 在此冷却状态下，尝试立即重新激活 `enactPolicy(RATIONING, true)`。
+   - **断言 2**：方法拦截并返回 `false`，强力锁死抢跑，杜绝冷却期内瞬发。
+
+### 交付物：
+只包含 `enactPolicy` 激活拦截、废除强冷方法实现、以及上限/冷却抢跑的 JUnit 单元测试代码。不含心跳推进 processTick 及多法令系数级联叠乘汇总逻辑。

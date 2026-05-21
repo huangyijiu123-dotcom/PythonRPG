@@ -1,0 +1,74 @@
+# MDU 12.4: 物流分拨中心曼哈顿辐射拓扑网与并发去重压测 (MDU-D: Radials & Concurrency Tests)
+
+作为 AI 建造与经营专家，你的任务是为分拨中心设计高精度的“曼哈顿空间物流辐射网络收集算法”，并为建筑管理管理器提供极端多线程并发读写下的“线程安全与零死锁性能压测”。
+
+---
+
+## 1. 曼哈顿几何拓扑网与压测契约 (Radial & Safety Contract)
+
+在建筑引擎中编写分拨中心几何覆盖面积搜罗算法，并对高频并发执行时状态一致性做出防御性测试：
+
+```kotlin
+// 计算全图所有 ACTIVE 状态的分拨中心（DISTRIBUTION）在特定等级半径下的曼哈顿距离网格覆盖
+// 半径计算公式：radius = level * 3
+// 返回所有受物流辐射的格子坐标去重集合 Set<Pair<Int, Int>>（用以驱动村民物流寻路及关卡物资刷新）
+fun getDistributionCoverageRadius(): Set<Pair<Int, Int>>
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **几何范围判定遗漏红线 (Manhattan Bounding Exclusions)**：
+   在收集网格坐标时，**物理距离公式必须严格遵守曼哈顿几何距离公式**，即：
+   $$\text{距离} = |x_1 - x_2| + |y_1 - y_2| \le \text{radius}$$
+   严禁使用欧几里得平方根公式。遍历边界必须牢牢锁死在 `[cx - radius, cx + radius]` 与 `[cy - radius, cy + radius]` 的矩形包络盒内，防止由于无限格遍历导致 CPU 算力卡死。
+2. **禁止产生非活跃分拨中心辐射**：未完工（`UNDER_CONSTRUCTION`）或已战损（`DESTROYED`）的分拨中心绝对禁止向外辐射任何物流网。
+
+### 机械式步骤指令：
+1. **曼哈顿物流拓扑搜罗算法实现 (`getDistributionCoverageRadius`)**：
+   - 步骤 A：新建去重集合：`val result = mutableSetOf<Pair<Int, Int>>()`。
+   - 步骤 B：**提取活跃分拨中心**：
+     - 筛选 `buildings.values` 中 `type == BuildingType.DISTRIBUTION` 且 `state == BuildingState.ACTIVE` 的建筑快照。
+   - 步骤 C：**几何网格覆盖搜罗**：
+     - 对每个满足条件的分拨中心 `(cx, cy)`，其辐射半径 `radius = level * 3`。
+     - 使用两层 For 循环，遍历范围 `x` 从 `cx - radius` 到 `cx + radius`，`y` 从 `cy - radius` 到 `cy + radius`。
+     - 若满足曼哈顿距离：`Math.abs(cx - x) + Math.abs(cy - y) <= radius`：
+       - 将 `Pair(x, y)` 塞入 `result` 中，利用 Set 的天然特性进行去重过滤。
+   - 步骤 D：返回 `result` 集合。
+
+---
+
+## MDU 12.4-TEST: 曼哈顿辐射圈去重与多线程读写并发压测
+
+编写单元测试 `BuildingDistributionStressTest.kt`。
+
+### 机械式测试用例：
+1. **分拨中心曼哈顿辐射覆盖与去重测试**：
+   - 往引擎手动录入两个 1 级的 `ACTIVE` 分拨中心：一个在 `(0, 0)`，一个在相邻的 `(1, 1)`。
+   - 每个 1 级分拨中心的覆盖半径 $radius = 1 \times 3 = 3$。
+   - 调用 `getDistributionCoverageRadius()`。
+   - **断言 1**：集合中包含 `(3, 0)`（到 `(0,0)` 曼哈顿距离正好为 3），但不包含 `(3, 1)`（到两个分拨中心距离均大于 3）。
+   - **断言 2**：重合的网格点被完美去重，无任何坐标冗余出现。
+2. **多线程并发建造、心跳与辐射查询零死锁压测**：
+   - 实例化 `BuildingEngine` 并注入 10 个已初始化的建筑。
+   - 启动 50 个高并发协程 Workers 并发轰炸：
+     - 20 个协程疯狂调用 `processTick()` 滚动时序。
+     - 20 个协程疯狂调用 `getDistributionCoverageRadius()`。
+     - 10 个协程疯狂调用 `startConstruction` 放置民房。
+   - **断言**：运行足够次数，系统运转正常，未发生任何 ConcurrentModificationException 脏读崩溃或线程永久挂起，捍卫并发性能底线。
+
+---
+
+## 🔒 语义级冻结声明 (Semantic-Level Freeze Declaration)
+
+当本 MDU 及其配套测试完全通过后，`BuildingEngine` 核心语义冻结。
+
+### 冻结语义边界：
+1. **物流半径几何公式绝对锁定**：分拨中心覆盖半径必须为 `level * 3` 且采用曼哈顿绝对值求和距离，去重辐射网络格式终生有效。
+2. **仓储扩容强制回调**：大本营王城、地方仓库及分拨中心升级完工时，反向背包同步回调 `notifyWarehouseCapacityExpanded` 不容漏减，扩容量公式为 `500 * level`。
+3. **安全拦截链锁定**：重叠建造判定及允许地形集合拦截规则不得更改。
+
+### 允许进化范围 (Permitted Evolutions)：
+- 允许在静态表中扩展其他新增建筑类型（如“军营”或“水渠”），但其建造流转进度控制和完工机制必须毫无保留地遵循本模块的 Lifecycle 设计。

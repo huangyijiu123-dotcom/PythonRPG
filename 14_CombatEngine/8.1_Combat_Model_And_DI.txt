@@ -1,0 +1,121 @@
+# MDU 8.1: 战斗数据模型与生命周期会话管理 (MDU-A: Model & Session Management)
+
+作为 AI 游戏战斗系统设计专家，你的任务是为异步答题战斗系统构建基础数据快照结构、依赖注入契约及高安全的战斗会话生命周期存储管理引擎。
+
+---
+
+## 1. 核心数据与会话契约 (Data Contract)
+
+在桥接器中定义以下底层战斗快照数据类、枚举及统一接口（确保字段的可变性与隔离性）：
+
+```kotlin
+// 1. 怪物静态配置快照
+data class MonsterSnapshot(
+    val monsterId: Long,
+    val typeId: String,
+    val isBoss: Boolean,
+    val level: Int,
+    val maxHp: Int,
+    val strength: Int,
+    val agility: Int,
+    val defense: Int
+)
+
+// 2. 战斗状态机实时会话
+data class BattleSession(
+    val sessionId: Long,
+    val adventurerId: Long,
+    val monsterSnapshot: MonsterSnapshot,
+    var adventurerCurrentHp: Int,
+    var monsterCurrentHp: Int,
+    var comboCount: Int = 0,
+    var consecutiveTimeoutCount: Int = 0,
+    var isManualMode: Boolean = true,
+    val startedAtTick: Long,
+    var damageMultiplier: Float = 1.0f // MP 技能增益系数缓冲
+)
+
+// 3. 答题结算回执
+data class AnswerResult(
+    val correct: Boolean,
+    val damageDealt: Int,
+    val damageTaken: Int,
+    val isCritical: Boolean,
+    val newComboCount: Int,
+    val critChance: Float,
+    val sessionEnded: Boolean,
+    val endReason: String?
+)
+
+// 4. 战斗终结原因
+enum class BattleEndReason {
+    MONSTER_DEFEATED, ADVENTURER_INJURED, FLEE, TIMEOUT_ESCAPE
+)
+
+// 5. 战斗全局终结事件广播
+data class BattleEndEvent(
+    val sessionId: Long,
+    val reason: BattleEndReason,
+    val expGained: Int,
+    val drops: Map<String, Int>
+)
+
+// 6. 外部持久属性查询供应者接口
+interface CombatDependencyProvider {
+    fun getAdventurerTotalAttack(adventurerId: Long): Int
+    fun getAdventurerTotalDefense(adventurerId: Long): Int
+    fun getAdventurerHp(adventurerId: Long): Int
+    fun getAdventurerMp(adventurerId: Long): Int
+    fun deductAdventurerMp(adventurerId: Long, amount: Int): Boolean
+}
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **绝对隔离红线 (No Persistent State Mutations)**：
+   本模块**绝对禁止直接读写任何外部持久化数据库或 EntityStateManager**！所有的参战属性拉取及 MP 扣减必须严格通过 `CombatDependencyProvider` 进行，且冒险者的 HP 扣除最终通过 `AnswerResult.damageTaken` 传递，由外部系统自行持久化，隔离系统竞态。
+2. **禁止战斗会话悬空残留**：战斗在结束后必须立即从内存 Map 中物理移除，防范内存泄露。
+
+### 机械式步骤指令：
+1. 创建核心类 `class CombatEngine(private val provider: CombatDependencyProvider)`。
+2. 内部维护并发安全的战斗会话管理字典与结束广播 SharedFlow：
+   - `private val activeSessions = ConcurrentHashMap<Long, BattleSession>()`
+   - `private val _battleEndFlow = MutableSharedFlow<BattleEndEvent>(extraBufferCapacity = 64)`
+   - `val battleEndFlow: SharedFlow<BattleEndEvent> = _battleEndFlow`
+3. 实现生命周期管理 API：
+   - `fun startBattle(adventurerId: Long, monster: MonsterSnapshot, startedTick: Long): Long`：
+     - 查重过滤：校验 `adventurerId` 是否已存在于任何活跃会话中。若是，直接返回对应的 `sessionId` 或抛出 `IllegalStateException` 防止多重战斗分身。
+     - 从 `provider` 动态获取当前 HP。
+     - 生成唯一自增 ID（使用 `AtomicLong`）。
+     - 创建 `BattleSession` 并存入 `activeSessions`。
+   - `fun getSession(sessionId: Long): BattleSession? = activeSessions[sessionId]`
+   - `fun getActiveSessionIds(): List<Long> = activeSessions.keys.toList()`
+   - `private fun endBattle(sessionId: Long, reason: BattleEndReason)`（私有，供结算触发）：
+     - 从 `activeSessions` 中移出。
+     - 组装 `BattleEndEvent`，通过 `_battleEndFlow.tryEmit(event)` 发射，完成生命周期回收。
+
+---
+
+## MDU 8.1-TEST: 战斗启动与生命周期回收黑盒测试
+
+编写单元测试 `CombatSessionLifecycleTest.kt`。
+
+### 机械式测试用例：
+1. **战斗双开拦截防御测试**：
+   - 注入 Mock 属性提供者，设定冒险者 1001 的 HP 为 100。
+   - 调用 `startBattle(adventurerId = 1001, monster = MockMonster, startedTick = 1)` 成功启动战斗 1。
+   - 再次尝试调用 `startBattle(1001, MockMonster, 1)`（企图为同一个冒险者开启双重战斗分身）。
+   - **断言**：抛出 `IllegalStateException` 或直接熔断，避免数据穿透。
+2. **正常战斗生命周期回收测试**：
+   - 启动战斗，得到 `sessionId`。
+   - 获取 `getSession(sessionId)`。
+   - **断言 1**：成功返回 `BattleSession` 快照，且 `adventurerCurrentHp` 精准等于 `100`。
+   - 调用内部 `endBattle(sessionId, BattleEndReason.FLEE)`。
+   - **断言 2**：`getSession(sessionId)` 返回 `null`。
+   - **断言 3**：`battleEndFlow` 订阅流中成功收到一条 `FLEE` 原因的 `BattleEndEvent`，完成了内存完美物理回收。
+
+### 交付物：
+只包含基础战斗数据模型、依赖注入接口、`CombatEngine` 会话生命周期起停管理、以及会话拦截回收测试。不含具体公式、超时或 MP 技能实现。

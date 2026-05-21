@@ -1,0 +1,85 @@
+# MDU 12.2: 地形匹配合法性校验与建造/升级启动器 (MDU-B: Pipeline & Validator)
+
+作为 AI 建造与经营专家，你的任务是为建筑引擎开发坚不可摧的“地形合法性拦截器”以及允许开始升级进程的“升级事务状态启动器”。
+
+---
+
+## 1. 建造与升级启动契约 (Pipeline & Callback Contract)
+
+在建筑引擎外层声明依赖注入的回调接口，并实现核心的放置与升级拦截 API（保障业务校验的高度严密性）：
+
+```kotlin
+// 建筑外部依赖回调接口（用于验证格子地形、反向同步扩容等）
+interface BuildingDependencyProvider {
+    // 仓库/分拨中心升级到 ACTIVE 时，反向扩容底层的背包上限
+    fun notifyWarehouseCapacityExpanded(warehouseId: Long, additionalCapacity: Int)
+    
+    // 查询指定坐标格子的地形 ID，供地形拦截器判别放置合法性
+    fun getTerrainType(x: Int, y: Int): String
+}
+
+// 启动新建筑的建造（返回新建的建筑 ID。若因地形不符或已有建筑等拦截失败，则返回 null）
+fun startConstruction(type: BuildingType, x: Int, y: Int): Long?
+
+// 开始升级现有建筑（进入 UPGRADING 状态。若未满级且状态合法返回 true，否则拦截返回 false）
+fun startUpgrade(buildingId: Long): Boolean
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **地形匹配污染红线 (Terrain Misplacement Redline)**：
+   在调用 `startConstruction` 时，**必须严格强制校对地形**！如果该坐标地形 `dependencyProvider.getTerrainType(x, y)` 不在建筑静态配置的 `allowedTerrains` 集合内，必须立即拦截返回 `null`，严防“在草原上开铁矿”或“在深山建农田”等常识性 Bug。
+2. **禁止覆盖建造**：若目标坐标已有任何非 `DESTROYED` 状态的建筑，必须强制返回 `null`，防止重叠堆叠。
+
+### 机械式步骤指令：
+1. **实现新建筑建造安全拦截 (`startConstruction`)**：
+   - 步骤 A：**重叠物理校验**：调用 `getBuildingAt(x, y)` 寻找现有建筑，如果存在且其状态非 `DESTROYED`，直接返回 `null`。
+   - 步骤 B：**地形匹配拦截**：
+     - 调用依赖 `val terrain = dependencyProvider.getTerrainType(x, y)`。
+     - 获取配置：`val config = buildingConfigs[type] ?: return null`。
+     - 若 `terrain` 不属于 `config.allowedTerrains`，强力返回 `null`（地形冲突熔断）。
+   - 步骤 C：**录入存盘**：
+     - 申请自增 ID：`val newId = buildingIdGenerator.getAndIncrement()`。
+     - 构造新建快照：`val newSnap = BuildingSnapshot(newId, type, x, y, level = 0, BuildingState.UNDER_CONSTRUCTION, constructionProgress = 0, maxConstructionProgress = config.baseConstructionTicks)`。
+     - 存入 `buildings` 并返回 `newId`。
+2. **实现升级进程安全开启 (`startUpgrade`)**：
+   - 步骤 A：提取建筑快照 `val snap = buildings[buildingId] ?: return false`。
+   - 步骤 B：**状态及等级验证**：
+     - 若 `snap.state != BuildingState.ACTIVE`，强力返回 `false`（只有运行中的建筑能升级）。
+     - 获取配置：`val config = buildingConfigs[snap.type] ?: return false`
+     - 若 `snap.level >= config.maxLevel`，强力返回 `false`（等级溢出拦截）。
+   - 步骤 C：**升级重置**：
+     - 设定升级需要的时间时长：
+       `val upgradeTicks = config.baseConstructionTicks * (snap.level + 1)`
+     - 采用线程安全更新：
+       - `snap.state = BuildingState.UPGRADING`
+       - `snap.constructionProgress = 0`
+       - `snap.maxConstructionProgress = upgradeTicks`（这三个字段标记为可变）
+     - 返回 `true`。
+
+---
+
+## MDU 12.2-TEST: 地理地形匹配与满级升级安全拦截测试
+
+编写单元测试 `BuildingPipelineValidationTest.kt`。
+
+### 机械式测试用例：
+1. **地形错配强制拦截测试**：
+   - Mock 环境：`(5, 5)` 格子的地形为 `"PLAINS"` (草原)。
+   - 尝试在 `(5, 5)` 建造采石场 `BuildingType.QUARRY`（仅限山脉 `MOUNTAIN`）。
+   - **断言**：`startConstruction` 返回结果严格为 `null`，地形硬拦截成功。
+2. **坐标物理重叠建造拦截测试**：
+   - Mock 地形为 `"PLAINS"`。
+   - 尝试在 `(0, 0)` 建造民房 `BuildingType.COTTAGE`，返回有效 ID。
+   - 再次尝试在 `(0, 0)` 建造另一民房。
+   - **断言**：第二次建造强制返回 `null`，防重叠锁定生效。
+3. **升级越界超封顶拦截测试**：
+   - 直接往容器注入一个 `ACTIVE` 状态的民房，等级为 `5`（已达民房封顶满级）。
+   - 尝试调用 `startUpgrade` 对该满级民房进行升级。
+   - **断言**：方法返回 `false`（禁止在 5 级时继续升级，完美封锁）。
+
+### 交付物：
+只包含 `startConstruction` 建造拦截、`startUpgrade` 状态重设方法、以及地形重叠及越界拦截的 JUnit 单元测试代码。不含心跳推进 processTick 及辐射曼哈顿网络收集算法。

@@ -1,0 +1,104 @@
+# MDU 16.1: 法令参数枚举、乘数快照与配置容器 (MDU-A: Configurations & Models)
+
+作为 AI 全局法令与状态控制专家，你的任务是为法令系统定义法令类型枚举、运行状态、修正系数快照包实体，并预装载 6 大执政法令的持续时长、金币开销、冷却时长及对应的环境修正系数矩阵。
+
+---
+
+## 1. 全局法令与环境系数契约 (Data Contract)
+
+在桥接器中定义以下核心枚举、法令 Snapshot 以及修正系数实体（确保系数浮点数的读取可见性）：
+
+```kotlin
+// 1. 六大执政法令类型
+enum class PolicyType {
+    RATIONING,          // 🍞 口粮配给制 (持续 8 Tick，消耗 30 金币，冷却 2)
+    MOBILIZATION,       // ⚔️ 全民皆兵 (持续 6 Tick，消耗 50 金币，冷却 2)
+    OPEN_TRADE,         // 📈 商业开放 (持续 10 Tick，消耗 80 金币，冷却 2)
+    FRANTIC_GATHERING,  // ⛏️ 狂热采集 (持续 6 Tick，消耗 40 金币，冷却 2)
+    TECH_LEAP,          // 🔬 科技跃进 (持续 12 Tick，消耗 100 金币，冷却 2)
+    SCORCHED_EARTH      // 🛡️ 坚壁清野 (持续 8 Tick，消耗 60 金币，冷却 2)
+}
+
+// 2. 三大法令运转状态
+enum class PolicyState {
+    INACTIVE, // 未颁布
+    ACTIVE,   // 正式颁布生效中
+    COOLDOWN  // 废除或到期后的冷静冷却期
+}
+
+// 3. 实时法令运行快照
+data class PolicySnapshot(
+    val type: PolicyType,
+    var state: PolicyState,
+    var remainingTicks: Int // ACTIVE 时为剩余生效 Tick，COOLDOWN 时为剩余冷却 Tick
+)
+
+// 4. 全局修正系数实体（供 ActionProcessor 等被动读取查表，基础值全部硬性规定为 1.0f）
+data class PolicyModifiers(
+    val foodConsumptionMultiplier: Float = 1.0f, // 居民粮食消耗率 (配给 -> 0.5f)
+    val energyRestoreMultiplier: Float = 1.0f,   // 体力恢复速率 (配给 -> 0.7f)
+    val combatAttackMultiplier: Float = 1.0f,    // 冒险者攻击倍率 (皆兵 -> 1.2f)
+    val harvestYieldMultiplier: Float = 1.0f,    // 资源采集倍率 (皆兵 -> 0.7f, 狂热 -> 1.3f)
+    val caravanSpeedMultiplier: Float = 1.0f,    // 商队移动速度 (商业开放 -> 1.5f)
+    val tradeProfitMultiplier: Float = 1.0f,     // 跑商交易利润倍率 (商业开放 -> 0.85f)
+    val energyCostMultiplier: Float = 1.0f,      // 劳作体力消耗率 (狂热 -> 2.0f)
+    val upgradeCostMultiplier: Float = 1.0f,     // 建筑升级开销倍率 (科技跃进 -> 0.8f)
+    val techCostMultiplier: Float = 1.0f,        // 科研开销倍率 (科技跃进 -> 0.85f)
+    val buildingDefenseMultiplier: Float = 1.0f, // 建筑战损防御倍率 (坚壁清野 -> 1.5f)
+    val moveSpeedMultiplier: Float = 1.0f        // 领地村民移速倍率 (坚壁清野 -> 0.8f)
+)
+
+// 5. 单个法令静态配置
+data class PolicyConfig(
+    val durationTicks: Int,
+    val goldCost: Int,
+    val cooldownTicks: Int,
+    val modifiers: PolicyModifiers
+)
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **法令环境系数改写红线 (Strict Policy Parameters)**：
+   6 大法令的**持续时间、金币价格、冷却时间以及生效时的具体乘数浮点参数必须硬编码写死**，绝对禁止在运行时动态增改配置，防止领地治理数值链崩塌。
+2. **禁止参数空缺**。
+
+### 机械式步骤指令：
+1. **硬编码 6 大法令静态配置矩阵装配**（在 `PolicyEngine` 内部声明静态配置字典 `val configs: Map<PolicyType, PolicyConfig>`）：
+   - `RATIONING`：持续 8，金币 30，冷却 2。系数：`foodConsumptionMultiplier = 0.5f`, `energyRestoreMultiplier = 0.7f`。
+   - `MOBILIZATION`：持续 6，金币 50，冷却 2。系数：`combatAttackMultiplier = 1.2f`, `harvestYieldMultiplier = 0.7f`。
+   - `OPEN_TRADE`：持续 10，金币 80，冷却 2。系数：`caravanSpeedMultiplier = 1.5f`, `tradeProfitMultiplier = 0.85f`。
+   - `FRANTIC_GATHERING`：持续 6，金币 40，冷却 2。系数：`harvestYieldMultiplier = 1.3f`, `energyCostMultiplier = 2.0f`。
+   - `TECH_LEAP`：持续 12，金币 100，冷却 2。系数：`upgradeCostMultiplier = 0.8f`, `techCostMultiplier = 0.85f`。
+   - `SCORCHED_EARTH`：持续 8，金币 60，冷却 2。系数：`buildingDefenseMultiplier = 1.5f`, `moveSpeedMultiplier = 0.8f`。
+2. **初始化高安全的并发状态字典**：
+   - 实例化 `class PolicyEngine`。
+   - 内部维护并发安全的法令实时容器字典：
+     `private val policies = ConcurrentHashMap<PolicyType, PolicySnapshot>()`
+   - 在 `init` 构造块中，**自动将 6 种 Policy 默认全部以 INACTIVE 态、remainingTicks=0 预先装填存盘**。
+3. **编写快照拉取 API**：
+   - `fun getAllPolicies(): List<PolicySnapshot> = policies.values.toList()`
+
+---
+
+## MDU 16.1-TEST: 法令静态配置与状态容器预装载测试
+
+编写单元测试 `PolicyConfigAndContainerTest.kt`
+
+### 机械式测试用例：
+1. **口粮配给与坚壁清野配置参数精度测试**：
+   - 实例化 `PolicyEngine`。
+   - 获取 `RATIONING` 口粮配给制配置。
+   - **断言 1**：持续时长精准为 `8` Ticks，金币价格为 `30`，粮食消耗倍率精准等于 `0.5f`。
+   - 获取 `SCORCHED_EARTH` 坚壁清野配置。
+   - **断言 2**：金币价格为 `60`，冷却时长精准为 `2`，建筑防御倍率精准等于 `1.5f`。
+2. **开局默认未颁布状态测试**：
+   - 调用 `getAllPolicies()` 拉取所有法令状态列表。
+   - **断言 1**：状态列表的大小精准等于 `6`。
+   - **断言 2**：所有法令的初始状态必须 100% 均为 `PolicyState.INACTIVE`，且计时器 `remainingTicks` 均为 0。
+
+### 交付物：
+只包含基础法令数据模型、硬编码静态配置字典、初始容器自装载、快照获取实现、以及配置项和初始状态的 JUnit 单元测试代码。不含任何法令颁布校验、时序衰减和乘数级联叠乘汇总逻辑。

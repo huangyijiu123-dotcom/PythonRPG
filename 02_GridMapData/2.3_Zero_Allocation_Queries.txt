@@ -1,0 +1,246 @@
+# MDU 2.3: 零分配区域与条件过滤查询
+
+## 任务目标
+
+在上一步的基础上，实现高性能、低内存分配（GC 友好）的区域拉取与全局过滤查询接口。
+
+**输出标准**：区域查询必须零临时对象创建（禁用 Coordinate 中间对象），过滤查询必须避免双重堆分配（禁用 `toList()` 预拷贝）。
+
+---
+
+## 1. 核心接口契约（不可更改方法签名）
+
+### 1.1 getTilesInRegion(x1: Int, y1: Int, x2: Int, y2: Int): List<TileData>
+
+```kotlin
+// 获取某个矩形区域内的所有已知格子数据
+// (x1, y1) 为左下角，(x2, y2) 为右上角
+fun getTilesInRegion(x1: Int, y1: Int, x2: Int, y2: Int): List<TileData>
+```
+
+### 1.2 filterTiles(predicate: (TileData) -> Boolean): List<TileData>
+
+```kotlin
+// 高效率过滤满足特定条件的格子（全局扫描）
+fun filterTiles(predicate: (TileData) -> Boolean): List<TileData>
+```
+
+---
+
+## 2. 性能瓶颈与防爆红线
+
+### 2.1 GC 优化哲学
+
+地图区域查询和过滤操作在游戏寻路、局部刷新与视口渲染中属于**超高频热路径 (Hot Path)**。如果有几万个格子，任何不当的临时对象创建都会瞬间触发 Android GC 抖动，引发掉帧。
+
+### 2.2 实现区域零对象拉取
+
+**步骤 A**：估算宽高尺寸
+
+```kotlin
+val dx = kotlin.math.abs(x2 - x1) + 1
+val dy = kotlin.math.abs(y2 - y1) + 1
+```
+
+**步骤 B**：创建结果列表（带容量预估）
+
+```kotlin
+val estimatedCapacity = kotlin.math.min(size(), dx * dy)
+val result = ArrayList<TileData>(estimatedCapacity)
+```
+
+**步骤 C**：双重循环遍历（关键！）
+
+```kotlin
+for (x in minOf(x1, x2)..maxOf(x1, x2)) {
+    for (y in minOf(y1, y2)..maxOf(y1, y2)) {
+        val key = packToLong(x, y)
+        val tile = tileMap[key]
+        if (tile != null) {
+            result.add(tile)
+        }
+    }
+}
+return result
+```
+
+**完整实现**：
+```kotlin
+fun getTilesInRegion(x1: Int, y1: Int, x2: Int, y2: Int): List<TileData> {
+    val minX = minOf(x1, x2)
+    val maxX = maxOf(x1, x2)
+    val minY = minOf(y1, y2)
+    val maxY = maxOf(y1, y2)
+    
+    val dx = maxX - minX + 1
+    val dy = maxY - minY + 1
+    val estimatedCapacity = kotlin.math.min(size(), dx * dy)
+    val result = ArrayList<TileData>(estimatedCapacity)
+    
+    for (x in minX..maxX) {
+        for (y in minY..maxY) {
+            val key = packToLong(x, y)
+            val tile = tileMap[key]
+            if (tile != null) {
+                result.add(tile)
+            }
+        }
+    }
+    return result
+}
+```
+
+### 2.3 实现高效过滤
+
+**极简内联实现**：
+
+```kotlin
+fun filterTiles(predicate: (TileData) -> Boolean): List<TileData> {
+    return tileMap.values.filter(predicate)
+}
+```
+
+---
+
+## 3. 禁止事项（硬性约束）
+
+1. **禁止创建 Coordinate 中间对象**：在 `getTilesInRegion` 中，绝对禁止先生成临时的 `Coordinate` 对象或 `List<Coordinate>` 坐标列表再循环。
+
+   **禁止以下模式**：
+   ```kotlin
+   // 危险：创建大量临时 Coordinate 对象
+   val coords = mutableListOf<Coordinate>()
+   for (x in x1..x2) {
+       for (y in y1..y2) {
+           coords.add(Coordinate(x, y))  // GC 噩梦！
+       }
+   }
+   coords.forEach { getTile(it.x, it.y) }
+   ```
+
+   **正确做法**：直接在循环内用 `packToLong(x, y)` 查询，零临时对象。
+
+2. **禁止预拷贝整个 Map 值列表**：在 `filterTiles` 中，禁止调用 `tileMap.values.toList().filter(...)`。
+
+   **禁止以下模式**：
+   ```kotlin
+   // 危险：双重堆分配
+   return tileMap.values.toList().filter(predicate)
+   ```
+
+   **原因**：`toList()` 会复制整个值列表到新 ArrayList，然后 `filter` 又创建一个新列表，带来双重堆开销。
+
+   **正确做法**：直接对 `tileMap.values` 调用 `filter`，由 Kotlin 标准库内联处理，只分配结果列表。
+
+3. **禁止扩容前不预估容量**：创建 ArrayList 时应预估容量，避免多次扩容带来的额外分配。
+
+4. **禁止反向坐标假设**：方法签名未保证 x1 <= x2 和 y1 <= y2，必须使用 `minOf` / `maxOf` 处理。
+
+---
+
+## 4. 测试规范：GridMapDataQueryTest.kt
+
+### 4.1 测试原则
+
+⚠️ 黑盒测试强制规则：禁止使用反射访问内部容器。所有验证必须通过公开 API 反映。
+
+### 4.2 测试用例
+
+**T01：矩形区域精准边界测试**
+
+- 目的：验证区域查询精确返回指定范围内的格子
+- 步骤：
+  1. 实例化 `GridMapData`
+  2. 在 `x` 轴为 `-2..2`、`y` 轴为 `-2..2` 的矩形范围内连续写入所有 25 个坐标格子
+  3. 调用 `getTilesInRegion(-2, -2, 2, 2)`
+- 断言 1：返回的 `List<TileData>` 大小必须精确等于 25
+- 断言 2：所有格子坐标均在预期区域内
+- 步骤续：
+  4. 调用 `getTilesInRegion(-5, -5, -3, -3)`（完全不重叠的空旷区域）
+- 断言 3：返回的列表大小为 0
+- 通过标准：边界精确，空区域返回空列表
+
+**T02：多维度条件过滤测试**
+
+- 目的：验证过滤逻辑正确处理多条件组合
+- 步骤：
+  1. 设置 5 个格子
+  2. 其中 3 个格子设置 `hasMonster = true` 且 `exploreStatus = EXPLORED`
+  3. 另外 2 个设置 `hasMonster = false` 且 `exploreStatus = UNEXPLORED`
+  4. 调用 `filterTiles { it.hasMonster && it.exploreStatus == ExploreStatus.EXPLORED }`
+- 断言 1：返回列表大小必须精确等于 3
+- 断言 2：每个格子的 `hasMonster` 均为 `true`
+- 断言 3：每个格子的 `exploreStatus` 均为 `EXPLORED`
+- 通过标准：过滤条件精确匹配
+
+**T03：反向坐标区域测试**
+
+- 目的：验证反向坐标（x1 > x2 或 y1 > y2）正确处理
+- 步骤：
+  1. 写入与 T01 相同的 25 个格子
+  2. 调用 `getTilesInRegion(2, 2, -2, -2)`（反向坐标）
+- 断言：返回列表大小仍为 25
+- 通过标准：反向坐标自动修正
+
+---
+
+## 5. 测试框架要求
+
+- 使用 kotlin.test 断言库
+- 每个测试方法独立，无执行顺序依赖
+- 禁止使用反射访问私有字段
+- 区域边界测试需覆盖正向和反向坐标
+
+---
+
+## 6. 输出要求
+
+1. 仅输出 Kotlin 代码文件（GridMapData.kt 增量 + GridMapDataQueryTest.kt）
+2. 包含：两个接口实现、零分配双重循环、容量预估、直接 filter 调用
+3. 不包含：批量写入锁、序列化广播逻辑
+4. 代码格式：遵循 Kotlin 官方约定
+
+---
+
+## 7. 模块边界说明
+
+**MDU 2.1（已完成）**：状态模型、坐标压缩、基础读写
+**MDU 2.2（已完成）**：局部属性原子更新、十字视野解锁
+**MDU 2.3（本章）**：零分配区域查询、条件过滤
+**MDU 2.4（后续）**：序列化与存档
+**MDU 2.5（后续）**：脏坐标流与完整性校验
+
+---
+
+## 8. 快速行为查阅
+
+**区域查询时序**：
+```
+getTilesInRegion(-2, -2, 2, 2)
+  → minX = -2, maxX = 2, minY = -2, maxY = 2
+  → dx = 5, dy = 5
+  → result = ArrayList(25)  // 容量预估
+  → for x in -2..2:
+      for y in -2..2:
+        key = packToLong(x, y)
+        tile = tileMap[key]
+        if (tile != null) result.add(tile)
+  → 返回 result（零 Coordinate 临时对象）
+```
+
+**过滤查询时序**：
+```
+filterTiles { it.hasMonster && it.exploreStatus == EXPLORED }
+  → tileMap.values.filter(predicate)
+  → Kotlin 内联处理，只分配结果列表
+  → 返回匹配列表（无 toList() 预拷贝）
+```
+
+**反向坐标处理**：
+```
+getTilesInRegion(2, 2, -2, -2)
+  → minX = minOf(2, -2) = -2
+  → maxX = maxOf(2, -2) = 2
+  → 等价于 getTilesInRegion(-2, -2, 2, 2)
+  → 正确返回 25 个格子
+```

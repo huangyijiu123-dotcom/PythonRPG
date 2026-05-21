@@ -1,0 +1,121 @@
+# MDU 6.4: 行为动作指令代理映射与指令超限安全截断 (MDU-D: Command Mapping & Truncation)
+
+作为 AI 编码与安全工程师，你的任务是填充动作代理中的 Python 可调用行为方法，将玩家脚本的意图平滑翻译为底层 `PlayerCommand`，并建立高并发下的**指令排队超限安全截断机制**。
+
+---
+
+## 1. 核心动作代理方法契约 (Action Implementations)
+
+在 `VillagerProxy`、`CaravanProxy`、`BuildingProxy` 中具体实现以下公开动作方法，将指令收集至全局 `commandBuffer` 队列中：
+
+### A. 村民动作代理 (`VillagerProxy`)
+```kotlin
+fun assign_job(job_name: String, x: Int, y: Int) {
+    commandBuffer.add(PlayerCommand.AssignJob(id, job_name, x, y))
+}
+
+fun return_home() {
+    commandBuffer.add(PlayerCommand.ReturnHome(id))
+}
+
+fun equip_tool(tool_name: String): Boolean {
+    // 步骤：查阅当前内存快照中的所有仓库。寻找拥有 tool_name 且库存大于 0 的最近仓库。
+    // 如果找到仓库 ID 9L 且距离最近：
+    //   commandBuffer.add(PlayerCommand.EquipTool(id, tool_name, 9L))
+    //   返回 true
+    // 如果全图所有仓库都没有该工具，则返回 false（不产生指令）
+    return false
+}
+```
+
+### B. 商队动作代理 (`CaravanProxy`)
+```kotlin
+fun assign_target(x: Int, y: Int) {
+    commandBuffer.add(PlayerCommand.AssignCaravanTarget(id, x, y))
+}
+
+fun start() {
+    commandBuffer.add(PlayerCommand.StartCaravan(id))
+}
+
+fun recall() {
+    commandBuffer.add(PlayerCommand.RecallCaravan(id))
+}
+
+fun trade_with(city_id: Long, is_buy: Boolean, item: String, amount: Int) {
+    commandBuffer.add(PlayerCommand.TradeWithCityState(id, city_id, is_buy, item, amount))
+}
+```
+
+### C. 建筑与生产动作代理 (`BuildingProxy`)
+```kotlin
+fun upgrade() {
+    commandBuffer.add(PlayerCommand.UpgradeBuilding(x, y))
+}
+
+// 仅在 type == "工房" 时有效，否则静默忽略
+fun queue_production(tool_type: String, count: Int) {
+    if (type == "工房") {
+        commandBuffer.add(PlayerCommand.QueueProduction(id, tool_type, count))
+    }
+}
+
+// 仅在 type == "铁匠铺" 时有效
+fun forge_equipment(template_id: String) {
+    if (type == "铁匠铺") {
+        commandBuffer.add(PlayerCommand.ForgeEquipment(template_id))
+    }
+}
+```
+
+---
+
+## 2. 指令超限拦截与熔断规约 (Command Flood Protection)
+
+### 禁止事项：
+1. **指令泛滥挂死宿主红线 (Command Flood Prevention)**：
+   **绝对禁止**玩家通过 Python 编写失控的 `for` 循环生成成千上万个指令塞爆 `ActionProcessor` 缓冲队列！
+2. **截断规约**：单次脚本执行产生的 `PlayerCommand` **最大上限强制锁定为 200 个**。一旦 `commandBuffer.size` 达到 200，后续所有的代理动作方法调用直接静默拦截不予写入，并自动在最终的 `ScriptResult.errorMessage` 追加 `👴 村长警告：大人在此 tick 下达的策略指令已超过 200 个最大负荷！超出的命令已被强力截断。` 提示，保障引擎并发安全性。
+
+### 机械式步骤指令：
+1. 在所有 Proxy 动作方法的写入开头添加超载过滤：
+   ```kotlin
+   if (commandBuffer.size >= 200) {
+       // 触发超载熔断，直接返回
+       return
+   }
+   ```
+2. 脚本运行结束后，在 Kotlin 侧通过：
+   `val finalCommands = commandBuffer.take(200)`
+   将其批量推送给 `ActionProcessor.enqueueCommand(cmd)`。
+
+---
+
+## MDU 6.4-TEST: 指令生成与超限熔断黑盒测试
+
+编写单元测试 `PythonCommandGenerationTest.kt`。
+
+### 机械式测试用例：
+1. **动作代理翻译指令精准性测试**：
+   - 实例化 `VillagerProxy`，传入 `id = 5`，状态为休息。
+   - 在 Python 环境下执行：`v.assign_job("FARMING", 10, 20)`。
+   - **断言 1**：共享的 `commandBuffer` 队列中多出了一个元素。
+   - **断言 2**：多出的元素类型精准为 `PlayerCommand.AssignJob`，其中 `villagerId == 5`，`job == "FARMING"`，坐标为 `(10, 20)`。
+2. **工具换装仓库定位匹配测试**：
+   - 设定快照中仓库 1 存有 `{"IRON_AXE" to 1}`（在 `(2, 2)`），仓库 2 存有 `{"IRON_AXE" to 5}`（在 `(0, 0)`）。
+   - 初始化村民在 `(1, 1)`（距离仓库 1 曼哈顿距离为 2，距离仓库 2 为 2，选择 ID 较小的 1）。
+   - 调用 `v.equip_tool("IRON_AXE")`。
+   - **断言 1**：方法返回 `true`。
+   - **断言 2**：`commandBuffer` 产生一条 `PlayerCommand.EquipTool(5, "IRON_AXE", 1L)` 指令。
+3. **指令超限 200 熔断截断测试**：
+   - 在 Python 沙箱中执行狂暴投递脚本：
+     ```python
+     for i in range(500):
+         v.assign_job("MINING", 1, 1)
+     ```
+   - **断言 1**：`ScriptResult.success` 返回 `true`。
+   - **断言 2**：`commandsEnqueued`（排队指令数）精准等于 `200`，绝不超出。
+   - **断言 3**：`errorMessage` 文本中包含 `"村长警告"` 且包含 `"超出的命令已被强力截断"`。
+
+### 交付物：
+只包含 `VillagerProxy`、`CaravanProxy`、`BuildingProxy` 的动作映射方法完善实现、200 指令上限静默熔断机制、及对应指令生成和超量截断 JUnit 单元测试。不含 AST 检查、全局 Context 查询及村长异常翻译模块。

@@ -1,0 +1,95 @@
+# MDU 8.5: 自动互殴步进、掉落资源算力与极限防穿透压测 (MDU-E: Auto Battle & Stress Tests)
+
+作为 AI 游戏数值策划与测试专家，你的任务是为战斗引擎设计基于随机波动倍率的“自动互殴挂机推进算法”，编写能够防范恶意高频刷装备掉落的“手动/自动掉落衰减结算器”，并进行并发战斗死斗的终极稳定性回归压测。
+
+---
+
+## 1. 自动挂机、掉落计算与状态契约 (Interface Contract)
+
+在 `CombatEngine` 中声明并实现以下挂机推进、物产掉落结算接口：
+
+```kotlin
+// 切换手动/自动挂机战斗模式
+fun setAutoMode(sessionId: Long, auto: Boolean)
+
+// 自动战斗挂机推进一步（协程主循环或 ActionProcessor 每 Tick 对处于 auto 模式的战斗调用此方法）
+// 进行双向对砍并扣血，返回本次对砍回执。若返回 null 或 sessionEnded=true 代表战局已终结物理移出
+fun processAutoBattle(sessionId: Long): AnswerResult?
+
+// 计算怪物掉落物资
+// 供挂机结算战斗胜利时在内部调用获取 drops
+fun calculateDrops(monster: MonsterSnapshot, isManual: Boolean, comboCount: Int): Map<String, Int>
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **掉落双写倾销防刷红线 (Dumping Defeat Redline)**：
+   自动战斗胜利获得的产出物数量**必须是手动无连击通关的 50% 斩断**！以此鼓励玩家练习编程答题以获得 100% 连击奖励产出，绝对防止外挂脚本无脑刷自动战斗拖垮全局经济平衡。
+2. **防爆零负值计算**：自动反击计算必须用 `coerceAtLeast(0.0f)` 保底，防止高防御下怪物对砍反而为玩家“加血”的逻辑穿透。
+
+### 机械式步骤指令：
+1. **实现自动互殴结算 (`processAutoBattle`)**：
+   - 步骤 A：定位战斗会话。若不存在或已不是活跃状态，直接返回 `null`。
+   - 步骤 B：**自动对决伤害公式**（拉取实时 $Att_{adv}$ 和 $Def_{adv}$）：
+     - 玩家攻击怪物伤害（0.6倍系数 + 0.8~1.2 浮动）：
+       $$D_{adv} = (\max(1.0f, Att_{adv} \times 0.6f - \text{monster.defense}) \times \text{Random.nextDouble}(0.8, 1.2).toFloat()).toInt()$$
+     - 怪物攻击玩家伤害（0.6倍防御减免保底0 + 0.8~1.2 浮动）：
+       $$D_{monster} = (\max(0.0f, \text{monster.strength} - Def_{adv} \times 0.6f) \times \text{Random.nextDouble}(0.8, 1.2).toFloat()).toInt()$$
+   - 步骤 C：**双原子生命值写回**：
+     - 扣怪血：`session.monsterCurrentHp = (session.monsterCurrentHp - D_{adv}).coerceAtLeast(0)`。
+     - 扣人血：`session.adventurerCurrentHp = (session.adventurerCurrentHp - D_{monster}).coerceAtLeast(0)`。
+   - 步骤 D：**双重死亡边界核对**：
+     - 若 `session.monsterCurrentHp <= 0` 且 `session.adventurerCurrentHp <= 0`：
+       - 同归于尽算玩家败北：调用 `endBattle(sessionId, BattleEndReason.ADVENTURER_INJURED)`。
+     - 若仅怪血归零：调用 `endBattle(sessionId, BattleEndReason.MONSTER_DEFEATED)`，发配 100% 掉落。
+     - 若仅人血归零：调用 `endBattle(sessionId, BattleEndReason.ADVENTURER_INJURED)`，经验 drops 均为 0。
+     - 其余情况：返回正常的进行中 AnswerResult。
+2. **实现掉落物资算力公式 (`calculateDrops`)**：
+   - 步骤 A：获取怪物理论掉落基准（例如 Mock 配方：`mapOf("GOLD" to 10 * monster.level, "CORE" to 1)`）。
+   - 步骤 B：**手动胜利通关**：
+     - 乘数系数为 `1.0f`。
+     - **连击爆击掉落增幅**：若 `comboCount >= 5`，有 20% 的摇点几率（`Random.nextFloat() < 0.2f`）使所有掉落物数量额外 $+1$ 或多掉落一件 `"RARE_GEM" to 1`。
+   - 步骤 C：**自动挂机胜利**：
+     - 物理乘数系数斩断为 `0.5f`。计算掉落并四舍五入 `(quantity * 0.5f).roundToInt()`。
+   - 步骤 D：返回最终掉落物资 Map。
+
+---
+
+## MDU 8.5-TEST: 自动挂机对砍、掉落斩断与极限防穿压测测试
+
+编写单元测试 `CombatAutoExecutionAndRegressionTest.kt`。
+
+### 机械式测试用例：
+1. **自动挂机伤害波动与双向战损测试**：
+   - 开启自动挂机模式：`setAutoMode(sessionId, true)`。
+   - 冒险者全攻击力 50，怪物防御 10。
+   - 调用 `processAutoBattle(sessionId)`。
+   - **断言 1**：双方 HP 同一时间发生了衰减（双写对砍生效）。
+   - **断言 2**：对小怪造成的伤害落入了合理浮动区间 `[(50*0.6-10)*0.8, (50*0.6-10)*1.2]` 即 `[16, 24]` 之间。
+2. **自动胜利物产 50% 物理斩断测试**：
+   - 设定怪物 1 级，基础掉落配置为 `{"GOLD" to 20, "IRON" to 4}`。
+   - 模拟手动全胜：调用 `calculateDrops(MockMonster, isManual = true, comboCount = 0)`。
+   - **断言 1**：获得全额 `{"GOLD" to 20, "IRON" to 4}`。
+   - 模拟自动胜利：调用 `calculateDrops(MockMonster, isManual = false, comboCount = 0)`。
+   - **断言 2**：物产被强硬拦腰折断，精准只得 `{"GOLD" to 10, "IRON" to 2}`，反刷保护有效。
+3. **并发死斗极限稳定性与防穿透压测**：
+   - 启动 50 个独立协程，每个协程维护一个活跃战局，高频进行自动对决推进。
+   - **断言 1**：高并发压迫下，核心战斗管理器未触发 ConcurrentModification 崩溃。
+   - **断言 2**：高防御下自动反击计算被保底锁死，怪物未对玩家发生反向回血的算力穿透。
+
+---
+
+## 🔒 语义级冻结声明 (Semantic-Level Freeze Declaration)
+
+当本 MDU 及其配套测试完全通过后，`CombatEngine` 核心语义冻结。
+
+### 冻结语义边界：
+1. **战斗公式锁定**：连击递增暴击概率（3~4题为 30%，5题以上 70%，暴击双倍）及对砍保底 1点伤害锁定为物理死数。
+2. **掉落 50% 折半封锁**：自动挂机产生的战利品产出必须绝对强硬封锁在手动胜率的一半，绝不妥协。
+3. **被迫自退避门槛**：连续 3 次超时必须强行清出战场转为 TIMEOUT_ESCAPE。
+
+### 允许进化范围 (Permitted Evolutions)：
+- 允许在 calculateDrops 字典里扩增不同种类怪物的稀有掉落物，但不能动摇上述三项核心暴击对砍及折半经济隔离规约。

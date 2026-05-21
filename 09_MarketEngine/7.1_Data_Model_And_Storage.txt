@@ -1,0 +1,105 @@
+# MDU 7.1: 城邦数据模型、容量管理与持久化存档 (MDU-A: Data Model & Serialization)
+
+作为 AI 经济系统设计专家，你的任务是为 A* 贸易结算系统搭建零依赖的基础城邦数据结构与存档读写序列化容器。
+
+---
+
+## 1. 核心数据与存储契约 (Data Contract)
+
+在桥接器中定义以下底层经济数据类、枚举及统一接口（确保字段可变性与序列化兼容）：
+
+```kotlin
+// 城邦类型：农耕城（食物过剩，缺木石）、矿业城（矿石过剩，缺食物）、贸易城（波动）
+enum class CityType { FARMING, MINING, TRADING }
+
+// 交易方向
+enum class TradeDirection { SELL, BUY }
+
+// 近期交易记录（滑窗判定）
+data class TradeRecord(
+    val tickId: Long,
+    val item: String,
+    val amount: Int, // 正数代表玩家卖给城邦，负数代表玩家从城邦买入
+    val direction: TradeDirection
+)
+
+// 查价快照包
+data class PriceInfo(
+    val currentPrice: Float,
+    val basePrice: Float,
+    val supplyRate: Float,
+    val demandCoeff: Float
+)
+
+// 交易回执
+data class TradeResult(
+    val success: Boolean,
+    val actualAmount: Int,
+    val goldEarned: Int,
+    val dumpingPenaltyApplied: Boolean,
+    val penaltyPriceMultiplier: Float,
+    val newReputation: Float,
+    val message: String
+)
+
+// 城邦中央数据模型
+data class CityStateData(
+    val id: Long,
+    val name: String,
+    val cityType: CityType,
+    val x: Int,
+    val y: Int,
+    val inventory: MutableMap<String, Int>,                 // 资源实时库存
+    val maxCapacity: Int = 1000,                            // 统一容量上限
+    val basePrices: MutableMap<String, Float>,              // 基准价格（可被倾销记忆永久篡改）
+    val demandCoefficients: Map<String, Float>,             // 需求系数
+    val dailyConsumptionRate: MutableMap<String, Float>,    // 自然消耗率（可被倾销记忆永久篡改）
+    var reputation: Float = 1.0f,                           // 信誉：-0.5 到 1.0
+    var isSuspended: Boolean = false,                       // 信誉过低挂起暂停交易
+    val tradeHistory: MutableList<TradeRecord> = mutableListOf(),
+    val dumpingCounts: MutableMap<String, Int> = mutableMapOf() // 对特定物资的累计倾销次数（记忆机制）
+)
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **绝对禁止引入任何外部业务系统依赖**：本模块是**纯粹且高内聚的经济运算模型**，严禁引入 GridMapData、EntityStateManager、TickEngine 甚至商队（Caravan）的概念，仅处理底层的 "ID/物资/数量" 计算。
+2. **禁止在找不到城邦时静默报错**：所有传入未知 `cityId` 的操作必须返回 Null 或 TradeResult(success = false)，不污染系统。
+
+### 机械式步骤指令：
+1. 创建 `class MarketEngine` 核心经济管理器。
+2. 在类内定义线程安全的城邦注册存储容器：
+   `private val cityStates = ConcurrentHashMap<Long, CityStateData>()`
+3. 实现生命周期管理 API：
+   - `fun registerCityState(city: CityStateData)`：将数据填入 `cityStates`。
+   - `fun getAllCityIds(): List<Long> = cityStates.keys.toList()`
+4. 使用 Gson 引擎实现全量存档的导入与导出：
+   - `fun exportToJson(): String`：调用 `Gson().toJson(cityStates.values.toList())`。
+   - `fun importFromJson(json: String)`：
+     - 清空当前数据：`cityStates.clear()`。
+     - 从 JSON 反序列化为列表，并逐个重新 `registerCityState` 塞回 Map。
+
+---
+
+## MDU 7.1-TEST: 数据模型注册与 Gson 持久化黑盒测试
+
+编写单元测试 `MarketEngineStorageTest.kt`。
+
+### 机械式测试用例：
+1. **城邦注册与快照字段读取测试**：
+   - 创建农耕城 CityStateData，初始金币设为 500， reoutation 为 1.0，库存设为 `{"FOOD" to 100}`。
+   - 调用 `registerCityState`。
+   - **断言 1**：`getAllCityIds()` 精准包含该城邦 ID。
+   - **断言 2**：读取该城邦快照，其 `inventory` 中的 `"FOOD"` 数量为 100，`maxCapacity` 为默认的 1000。
+2. **Gson 复杂经济模型存档回环验证**：
+   - 创建城邦数据，设定其 `dumpingCounts` 记忆状态为 `{"WOOD" to 4}`。
+   - 调用 `exportToJson()` 导出 JSON。
+   - 更改内存中该城邦的任何状态，调用 `importFromJson(json)` 还原。
+   - **断言 1**：城邦完全复原，且其累计倾销次数字典 `dumpingCounts` 中 `"WOOD"` 精准为 4。
+   - **断言 2**：读档时 `cityStates` 内存被安全清理重建，无脏数据残留。
+
+### 交付物：
+只包含基础数据结构、`MarketEngine` 管理类框架、Gson 存档往返、以及注册读档的 JUnit 测试代码。不含物价计算、倾销惩罚及交易执行逻辑。

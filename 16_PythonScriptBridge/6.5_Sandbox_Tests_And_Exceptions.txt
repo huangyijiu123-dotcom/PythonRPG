@@ -1,0 +1,89 @@
+# MDU 6.5: 村长翻译官、策略生命周期注入与沙箱语义冻结 (MDU-E: Village Translator & Strategy Lifecycle)
+
+作为 AI 语言与测试专家，你的任务是为 Python 策略沙箱注入游戏化友好异常翻译引擎（**村长翻译官**），搭建持久化策略的动态生命周期注册机制，并确立本模块的语义级冻结规约。
+
+---
+
+## 1. 核心翻译与生命周期契约 (Interface Contract)
+
+在桥接器中声明并实现以下异常翻译、错误历史及策略动态挂载注册接口：
+
+```kotlin
+// 异常翻译出口：接收底层的 Python 原始堆栈信息，翻译为温暖、游戏化的村长提示语
+fun translateException(rawExceptionMessage: String): String
+
+// 策略注册生命周期管理 API
+fun registerStrategy(name: String, triggerOn: TimePeriod, pythonCode: String)
+fun unregisterStrategy(name: String)
+fun getRegisteredStrategies(): List<String>
+fun clearErrorHistory()
+
+// 周期时段定义（与 TickEngine 协同匹配）
+enum class TimePeriod { MORNING, DAY, TWILIGHT, NIGHT }
+```
+
+### 👴 村长翻译对照字典规范：
+当捕获到 Python 异常抛出时，提取 Error 类型，按以下规则精准翻译：
+- `NameError` -> `👴 村长：大人，'{name}' 是啥？我没见过这个名字。检查一下拼写？`
+- `IndexError` -> `👴 村长：大人，您指向了一个不存在的位置！列表的下标是从 0 开始的哦。`
+- `TypeError` -> `👴 村长：大人，类型搞错了。给函数传了错误类型的参数？`
+- `AttributeError` -> `👴 村长：大人，这个对象没有这个属性或方法。是不是写错了？`
+- `KeyError` -> `👴 村长：大人，字典里没有这个键！先检查 key 是否存在？`
+- `ZeroDivisionError` -> `👴 村长：大人，除数不能为零！您的脚本出现了除以零的情况。`
+- 其他未知异常 -> `👴 村长：大人，脚本出了个我看不懂的错误：{rawExceptionMessage}。`
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **策略时段错配运行红线**：注册到 `registerStrategy` 中的持久化脚本，**必须且仅能**在 ActionProcessor 结算对应 `TimePeriod` 开始的第一 Tick 时自动触发执行，严禁在错误的时段内越权重复执行。
+2. **禁止错误记忆溢出**：错误历史记录最大上限限制为最近 5 次，超出后必须剔除最老记录，防止内存泄漏。
+
+### 机械式步骤指令：
+1. **实现错误历史记忆追问机制**：
+   - 内部维护一个并发安全的错误类型追踪列表：`private val errorHistory = CopyOnWriteArrayList<String>()`
+   - 在 `translateException` 被调用后，提取当前发生的 Exception 类名（如 `"NameError"`）。
+   - 将其追加到 `errorHistory` 尾部。如果 `errorHistory.size > 5`，移除索引 0 的旧值。
+   - 统计当前发生的 Error 类型在历史列表中出现的频次 $N$。
+   - **追加追问提示**：如果 $N \ge 3$，在返回的翻译文本末尾，强行追加：
+     `\n👴 这个错误我已经提醒大人 $N$ 次了，要不要打开帮助文档？`
+2. **实现持久策略自转驱动**：
+   - 使用 Map 存储注册的策略：`private val strategies = ConcurrentHashMap<String, Pair<TimePeriod, String>>()`
+   - 订阅 `TickEngine.timePeriodChangeFlow`（时段变更流）。当监听到新的时段（如进入 NIGHT）时，筛选所有 `TimePeriod == NIGHT` 的策略脚本，自动提取最新的 Entity 快照，调用 `executeScript` 进行静默推进，所得指令流自动注入 `ActionProcessor`。
+
+---
+
+## MDU 6.5-TEST: 翻译官与持久策略动态生命周期测试
+
+编写单元测试 `PythonScriptBridgeLifecycleTest.kt`。
+
+### 机械式测试用例：
+1. **村长友好翻译官 NameError 转换测试**：
+   - 在沙箱中故意投递包含未定义变量的错误代码：`print(undeclared_variable)`。
+   - **断言 1**：`ScriptResult.success` 返回 `false`，且 `errorType == "RUNTIME_ERROR"`。
+   - **断言 2**：`errorMessage` 精准包含 `"👴 村长：大人，'undeclared_variable' 是啥？"`。
+2. **同类错误连续 3 次触发警告追加测试**：
+   - 故意连续向沙箱投递 3 次会触发 `ZeroDivisionError` 的错误脚本：`1 / 0`。
+   - 提取第 3 次返回的 `errorMessage`。
+   - **断言**：错误文本末尾成功追加了 `"👴 这个错误我已经提醒大人 3 次了，要不要打开帮助文档？"` 追问语。
+3. **策略持久化注册与时域匹配自动执行测试**：
+   - 注册持久策略 `"NIGHT_FALLBACK"`，设定触发时段为 `TimePeriod.NIGHT`，脚本为村民回家指令。
+   - 模拟 TickEngine 时段变更流，发射 `TimePeriod.DAY` 信号。
+   - **断言 1**：策略未被触发执行。
+   - 发射 `TimePeriod.NIGHT` 时域变更信号。
+   - **断言 2**：策略自动启动并成功运行，产生的村民回家指令顺利注入了指令队列中。
+
+---
+
+## 🔒 语义级冻结声明 (Semantic-Level Freeze Declaration)
+
+当本 MDU 及其配套测试完全通过后，`PythonScriptBridge` 桥接沙箱核心语义冻结。
+
+### 冻结语义边界：
+1. **沙箱绝对只读**：所有注入 Python 命名空间的代理根对象（territory/map/guild）对外暴露的所有字段必须是 val 只读，拒绝任何 Python 侧的原地属性写篡改。
+2. **写操作强限制**：脚本一切动作只通过 commandBuffer 累积 PlayerCommand 方式注入，且单 Tick 必须在 200 个指令处执行强熔断。
+3. **安全 AST 绝对前置**：在 Chaquopy exec 执行前，必须强制调用内置的 Python AST 校验器，拒绝一切违禁 Import 和同步死循环 while True。
+
+### 允许进化范围 (Permitted Evolutions)：
+- 允许在只读 Proxy 实体类中扩展蛇形命名的只读字段（例如为 `VillagerProxy` 增加 `is_sleeping` 等字段），但绝对不允许破坏以上三条冻结的安全隔离边界。

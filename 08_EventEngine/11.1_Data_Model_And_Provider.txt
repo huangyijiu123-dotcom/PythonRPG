@@ -1,0 +1,91 @@
+# MDU 11.1: 突发事件数据模型与条件回调接口声明 (MDU-A: Data Model & Context Provider)
+
+作为 AI 随机事件调度专家，你的任务是为灾难管理系统搭建突发事件类型枚举、实时事件数据模型、变迁广播类，并声明安全的外部依赖注入回调接口。
+
+---
+
+## 1. 突发事件与回调提供者契约 (Data Contract)
+
+在桥接器中定义以下事件数据类、状态流转广播包以及上下文条件接口：
+
+```kotlin
+// 1. 六大突发事件类型
+enum class EventType {
+    FOREST_FIRE,        // 🔥 森林火灾（暴晒干旱引发）
+    FLOOD,              // 🌊 洪水泛滥（暴雨积水引发）
+    PLAGUE,             // 🦠 致命瘟疫（民房人口过密引发）
+    BOSS_RIOT,          // ⚔️ Boss 暴动（发现 Boss 长期未剿引发）
+    COLD_SNAP,          // 🧊 极寒寒流（与寒潮天候关联）
+    BUILDING_COLLAPSE   // 🏚️ 低级建筑坍塌（年久失修，触发即结算）
+}
+
+// 2. 活跃事件状态类
+data class ActiveEvent(
+    val eventId: Long,
+    val type: EventType,
+    val targetX: Int?,
+    val targetY: Int?,
+    val affectedBuildingId: Long?,     // 受影响的具体建筑 ID
+    var remainingTicks: Int,           // 剩余持续 Tick 寿命（-1 代表无限，直到被清理）
+    val severity: Int                  // 严重烈度
+)
+
+// 3. 事件广播事件更新包
+data class ActiveEventUpdate(
+    val event: ActiveEvent,
+    val action: String                 // "SPAWNED" | "UPDATED" | "EXPIRED" | "RESOLVED"
+)
+
+// 4. 环境条件获取依赖提供者（解耦核心引擎与具体建筑/天气系统）
+interface EventConditionProvider {
+    fun getCurrentWeather(): String
+    fun getRandomForestBuilding(): Long?   // 随机获取一个森林或伐木建筑 ID，用于引火
+    fun getRandomFarmBuilding(): Long?     // 随机获取一个农田或草原建筑 ID，用于灌洪
+    fun hasUndefeatedBoss(): Boolean       // 判定地图上是否存在已发现但未打败的 Boss
+}
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **绝对业务解耦红线 (Strict Decoupling Redline)**：
+   本模块是**纯粹的状态调度机**，**绝对禁止直接引用** `GridMapData`（地图格子）、`EntityStateManager`（村民数据）、`WeatherEngine`（天气引擎）或 `BuildingEngine`（建筑实体）！一切外部条件判定的获取必须由 `EventConditionProvider` 接口代理回调注入，捍卫代码纯净性。
+2. **禁止静默生成事件**：任何事件的新增、到期或被解决，必须毫无保留地通过 SharedFlow 广播分发，便于 Python 代码及 UI 捕获。
+
+### 机械式步骤指令：
+1. **建立事件调度主管理器**：
+   - 实例化 `class EventEngine(private val conditionProvider: EventConditionProvider)`。
+2. **建立线程安全的状态容器**：
+   - 内部维护并发安全的活跃事件字典：
+     `private val activeEvents = ConcurrentHashMap<Long, ActiveEvent>()`
+   - 定义原子自增事件 ID 发生器：
+     `private val eventIdGenerator = AtomicLong(1L)`
+3. **构建核心广播事件通道 (`eventFlow`)**：
+   - 内部定义为热流：
+     `private val _eventFlow = MutableSharedFlow<ActiveEventUpdate>(extraBufferCapacity = 64)`
+     `val eventFlow: SharedFlow<ActiveEventUpdate> = _eventFlow`
+4. **提供状态获取基础 API**：
+   - `fun getActiveEvents(): List<ActiveEvent> = activeEvents.values.toList()`
+   - `fun registerEvent(event: ActiveEvent)`：将事件录入 `activeEvents` 并触发 `_eventFlow.tryEmit(ActiveEventUpdate(event, "SPAWNED"))`。
+
+---
+
+## MDU 11.1-TEST: 事件录入与容器管理黑盒测试
+
+编写单元测试 `EventEngineLifecycleContainerTest.kt`。
+
+### 机械式测试用例：
+1. **基础事件录入与广播捕获测试**：
+   - 注入 Mock 属性提供者。
+   - 创建一个 `ActiveEvent(101L, EventType.PLAGUE, 10, 20, null, 6, 2)`。
+   - 调用 `registerEvent` 注册事件。
+   - **断言 1**：通过 `getActiveEvents()` 获取活跃列表，精准包含且只包含此瘟疫事件。
+   - **断言 2**：在 `eventFlow` 捕获列表中，成功接获一条 action 为 `"SPAWNED"` 且 ID 为 101L 的事件广播包。
+2. **多重并发事件读取隔离测试**：
+   - 注册多个不同的事件（森林火灾、洪水）。
+   - **断言**：`getActiveEvents()` 正确搜罗了全部数据，无任何数据丢失或并发脏读崩溃。
+
+### 交付物：
+只包含基础事件数据结构、依赖解耦提供者接口、`EventEngine` 基本框架、事件注册及 Flow 广播发射实现、以及基础容器存取和录入测试。不含任何概率计算、Tick倒计时自损及手动解决机制。

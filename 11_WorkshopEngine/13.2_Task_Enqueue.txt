@@ -1,0 +1,83 @@
+# MDU 13.2: 科技解锁与多材消耗安全排队拦截器 (MDU-B: Enqueue & Validators)
+
+作为 AI 工房生产与经营专家，你的任务是为制造管线开发前置科技拦截器及多材料库存扣减核销器，将安全检验通过的任务录入排队队列。
+
+---
+
+## 1. 任务入队与依赖扣减契约 (Enqueue & Validator Contract)
+
+在工房生产引擎外层声明依赖注入的回调接口，并实现核心的放置与排队校验拦截 API（保障资源划扣的高度的原子安全性）：
+
+```kotlin
+// 工房外部资源和科技依赖回调接口
+interface WorkshopDependencyProvider {
+    // 扣减全局仓库中的原材料（扣减成功返回 true，不足返回 false）
+    fun deductResources(resources: Map<String, Int>): Boolean
+
+    // 当任务被玩家中途取消时，返还未制造部分的 100% 原材料
+    fun refundResources(resources: Map<String, Int>)
+
+    // 生产完成一个成品时，反向让物理仓库模块执行加货上架
+    fun addToolToWarehouse(workshopBuildingId: Long, toolType: ToolType)
+
+    // 查寻科学院是否解锁了特定前置科技，以供高端铁斧/物流车进行图纸解锁
+    fun isTechUnlocked(techId: String): Boolean
+}
+
+// 往指定工房排队添加批量工具制造任务
+// 返回：是否材料扣减且入队成功（若科技未解、材料不足、工房未注册等拦截返回 false）
+fun queueProduction(workshopId: Long, toolType: ToolType, count: Int): Boolean
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **未解锁科技图纸引火红线 (Locked Blueprint Placement Redline)**：
+   在调用 `queueProduction` 时，**必须严格强制校对科技**！若要制造具有科技门槛的工具（如 IRON_AXE 需 IRON_FORGING 科技），若 `dependencyProvider.isTechUnlocked` 返回 `false`，必须立即强力拦截返回 `false`，禁止无图纸违规越界制造。
+2. **禁止静默透支**：调用扣料接口如果返回 `false`（代表主背包材料不足以支撑这 count 个的制造），必须无害退出并不准录入活跃任务队列，坚守资源平衡。
+
+### 机械式步骤指令：
+1. **实现制造任务图纸与扣料安全拦截 (`queueProduction`)**：
+   - 步骤 A：工房校验：提取 `val state = workshops[workshopId] ?: return false`（防无工房越界排单）。
+   - 步骤 B：**科技图纸拦截校验**：
+     - 获取工具配方配置：`val recipe = recipes[toolType] ?: return false`。
+     - 若 `recipe.requiredTechId != null`：
+       - 调用依赖：`val unlocked = dependencyProvider.isTechUnlocked(recipe.requiredTechId)`。
+       - 若 `unlocked` 为 `false`，强力返回 `false`（图纸被锁熔断）。
+   - 步骤 C：**批量材料划扣**：
+     - 计算原材料所需总量：
+       `val totalCost = recipe.materialCost.mapValues { (_, qty) -> qty * count }`
+     - 调用依赖扣减：`val success = dependencyProvider.deductResources(totalCost)`。
+     - 若 `success` 为 `false`，代表支付原材料失败，强力返回 `false`（缺料熔断）。
+   - 步骤 D：**构造入队**：
+     - 申请自增任务 ID：`val taskId = taskIdGenerator.getAndIncrement()`
+     - 构造新建任务快照：`val task = ProductionTask(taskId, toolType, totalCount = count, completedCount = 0, currentProgress = 0, requiredTicks = recipe.requiredTicks)`。
+     - 将其追加塞入 `state.activeTasks` 并返回 `true`。
+
+---
+
+## MDU 13.2-TEST: 前置科技解锁与材料缺乏拦截测试
+
+编写单元测试 `WorkshopEnqueueValidatorTest.kt`。
+
+### 机械式测试用例：
+1. **前置科技锁定强制拦截测试**：
+   - Mock 环境：科学院科技 `"IRON_FORGING"` 尚未解锁。工房 ID `101L` 已正常注册。
+   - 尝试排队批量生产 5 把铁斧 `BuildingType.IRON_AXE`。
+   - **断言**：`queueProduction` 直接拦截并返回 `false`，图纸科技保护起效。
+2. **原材料划扣不足拒绝入队测试**：
+   - Mock 环境：科学院已解锁 `"IRON_FORGING"`。
+   - 设定材料划扣回调：若尝试扣除 `IRON_AXE` 材料（木材25，铁矿15），扣料函数因仓储不足而返回 `false`。
+   - 尝试调用 `queueProduction` 排单生产 5 把铁斧。
+   - **断言**：方法拦截返回 `false`，活跃制造队列依旧保持清空，无悬挂幽灵任务。
+3. **合法扣料任务成功挂接测试**：
+   - Mock 环境：石斧免科技解锁。
+   - 设定材料扣减成功（返回 `true`）。
+   - 尝试排单生产 3 把石斧 `ToolType.STONE_AXE`。
+   - **断言 1**：`queueProduction` 返回 `true`。
+   - **断言 2**：读取该工房活跃列表，队列中精准包含此石斧生产单，其已完成数量 `completedCount` 为 0，进度 `currentProgress` 为 0。
+
+### 交付物：
+只包含 `queueProduction` 前置科技与批量消耗扣减拦截方法实现、任务挂写入队、以及对应科技/资源拦截的 JUnit 单元测试代码。不含心跳推进 processTick 及中途取消退回材料逻辑。

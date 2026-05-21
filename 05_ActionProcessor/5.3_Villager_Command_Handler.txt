@@ -1,0 +1,94 @@
+# MDU 5.3: 村民行为与岗位招募指令处理器 (MDU-C: Villager Command Handlers)
+
+作为 AI 编码助手，你的任务是为玩家的“指间控制”及 Python 脚本决策提供指令翻译接入，将接收的高层 `PlayerCommand` 村民与招募动作转换为状态机内部“意图快照更新”。
+
+---
+
+## 1. 核心接口处理器契约 (Interface Contract)
+
+实现一个能够被总线调用的村民核心领域指令处理器 `VillagerCommandHandler : CommandHandler`。它负责认领并响应以下四种指令：
+
+```kotlin
+// 认领判定：
+// canHandle 应在 cmd 为 AssignJob, ReturnHome, EquipTool 或 RecruitVillager 时返回 true
+override fun canHandle(command: PlayerCommand): Boolean
+
+// 业务分派：
+override fun handle(command: PlayerCommand)
+```
+
+### 指令 1: AssignJob (指派工作点岗位)
+- **动作**：
+  - 校验目标村民 `villagerId` 是否存在。若不存在直接无害返回。
+  - 调用 `entityState.updateVillagerJob(id, job, targetX, targetY)`。
+  - 将村民的自转状态更新为 `MOVING`（前往工作点）。
+
+### 指令 2: ReturnHome (强制回家)
+- **动作**：
+  - 校验目标村民 `villagerId` 是否存在。若不存在直接返回。
+  - 获取村民快照，读取其所属民房 ID `cottageId`。
+  - 检索民房 `cottageId` 的物理坐标（调用 `entityState.getWarehouse(cottageId)` 或大本营默认坐标 `(0, 0)` —— 如果 cottageId 找不到或代表大本营）。
+  - 将村民的寻路目标重置为该民房坐标。
+  - 将村民的自转状态强制变更为 `MOVING`（回家意图）。
+
+### 指令 3: EquipTool (指派仓库换装工具)
+- **动作**：
+  - 校验村民与目标仓库 `warehouseId` 是否存在。
+  - 读取仓库 `warehouseId` 的物理坐标 `(wx, wy)`。
+  - 将村民的寻路目标重置为该仓库坐标。
+  - 将村民的状态变更为 `EQUIPPING`（换装中状态）。
+  - 在村民快照的 `customAttributes` 临时注入换装工具 `"equip_tool_target" to toolId` 以供后续自转系统抵达后消费。
+
+### 指令 4: RecruitVillager (招募新村民)
+- **动作**：
+  - 在 `EntityStateManager` 内部生成一个新的唯一 ID（使用自增 ID）。
+  - 随机产生一个村民姓名（如 "VILLAGER_1" 序号叠加）。
+  - 默认属性设置：初始坐标设为大本营坐标 `(0, 0)`，初始体力为 `100`，状态为 `RESTING`，岗位为 `"IDLE"`，民房 cottageId 默认设为 `0L`（大本营宿舍），背包及工具装备均为空 Map。
+  - 调用 `entityState.registerVillager` 注册该新村民。
+  - 扣除玩家招募金币（例如 100 金币，调用 `entityState.updatePlayerGold(-100)`）。如果玩家金币不足，则直接拒绝招募返回 `false`。
+
+---
+
+## 2. 机械式步骤指令与核心隔离红线
+
+### 禁止事项：
+1. **绝对禁止在 Handler 内部预先计算寻路路径**：
+   指令处理器的全部职责是**“意图快照注入”**（修改状态、切换目标和注入配置）。绝对禁止在此处调用 `PathfindingEngine` 计算路线，或是扣除移动点数。实际移动与寻路必须全权交给 `VillagerAutomationSystem` 在自转 Tick 时统一执行。
+2. **禁止直接覆盖非原子性字段**：修改状态必须调用 MDU 3.2 提供的对应单点 `updateVillagerStatus` 或 `updateVillagerJob` 接口，不得绕开数据层进行内存级覆盖。
+
+### 机械式步骤指令：
+1. 实现 `class VillagerCommandHandler` 并通过构造注入 `EntityStateManager` 以及全局金币 API。
+2. 在 `handle` 中使用模式匹配将指令甩给对应的私有处理函数。
+3. `AssignJob` 步骤：
+   - 校验村民 `id` 存在性。
+   - 调用 `updateVillagerJob(id, cmd.job, cmd.targetX, cmd.targetY)`。
+   - 调用 `updateVillagerStatus(id, VillagerStatus.MOVING)`。
+4. `ReturnHome` 步骤：
+   - 读取民房坐标 `(hx, hy)`。
+   - 调用 `updateVillagerJob(id, oldJob, hx, hy)`（岗位保留，目标换为家）。
+   - 调用 `updateVillagerStatus(id, VillagerStatus.MOVING)`。
+
+---
+
+## MDU 5.3-TEST: 村民行为指令黑盒拦截测试
+
+编写单元测试 `VillagerCommandHandlerTest.kt`。
+
+### 机械式测试用例：
+1. **AssignJob 指令意图注入测试**：
+   - 注册村民 1，状态为 `RESTING`。
+   - 派发指令 `AssignJob(1, "WOODCUTTING", 10, 15)`。
+   - **断言 1**：村民 1 的 `currentJob` 变为了 `"WOODCUTTING"`，工作点目标变为了 `(10, 15)`。
+   - **断言 2**：状态自动切为了 `MOVING`，证明意图注入成功。
+2. **ReturnHome 强制回家拦截测试**：
+   - 注册村民 1，当前正处于 `WORKING` 状态，岗位为 `"FARMING"`，工作点为 `(5, 5)`。其民房 cottageId 对应的坐标在 `(0, 0)`。
+   - 派发指令 `ReturnHome(1)`。
+   - **断言**：村民 1 的状态变为了 `MOVING`，且寻路目标被变为了 `(0, 0)`（家坐标）。
+3. **金币不足拒绝招募测试**：
+   - 设定当前玩家金币余额为 50 金币。
+   - 派发指令 `RecruitVillager`（招募需要 100 金币）。
+   - **断言 1**：返回拒绝或检测到 `EntityStateManager` 内部并未多出任何新村民（注册失败）。
+   - **断言 2**：玩家金币依然保持为 50，没有被扣成负数。
+
+### 交付物：
+只包含 `VillagerCommandHandler` 类实现、对应的 canHandle/handle 映射分发、金币校验逻辑、及岗位派指/回家强制/招募阻断的 JUnit 黑盒测试。不含任何商队、经济建筑或战斗自转。

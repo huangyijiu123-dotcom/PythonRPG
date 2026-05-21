@@ -1,0 +1,248 @@
+# MDU 17.2: 严格串行调度管线与时钟异常防爆网
+
+## 任务目标
+
+为心跳协调器装填全局串行推进五大层级管线，并构建坚不可摧的"外部异常隔离防爆网"，保障游戏中央时针万无一失。
+
+**输出标准**：10 大模块必须严格串行同步执行；try-catch 必须包裹全部子系统；异常不得向外传播导致 Flow 断流。
+
+---
+
+## 1. 严格时序与异常隔离契约（不可更改执行顺序）
+
+### 1.1 严格串行推进逻辑
+
+机械式执行顺序（**绝对禁止异步并发**）：
+
+层级 1：环境层
+  - weatherEngine.processTick()
+  - policyEngine.processTick()
+
+层级 2：进度层
+  - buildingEngine.processTick()
+  - workshopEngine.processTick()
+  - forgeEngine.processTick()
+
+层级 3：事件与经济层
+  - eventEngine.processTick()
+  - marketEngine.processTick()
+
+层级 4：指令结算层
+  - 提取最新合并环境系数：val curModifiers = policyEngine.getModifiers()
+  - 驱动结算层：actionProcessor.processTick(curModifiers)
+
+层级 5：持久同步层
+  - entityState.emitStateDiff()
+  - mapData.emitDirtyTiles()
+
+---
+
+## 2. 机械式步骤指令
+
+### 2.1 在 collect 闭包中实现严格串行管线
+
+**完整实现**：
+
+```kotlin
+fun startLoop() {
+    if (activeJob.get() != null) {
+        return
+    }
+    
+    val newJob = coroutineScope.launch {
+        tickEngine.tickFlow.collect { tickEvent ->
+            // 步骤 A：撑起防爆网隔离边界
+            try {
+                // 步骤 B：层级 1 - 环境更新
+                weatherEngine.processTick()
+                policyEngine.processTick()
+                
+                // 步骤 C：层级 2 - 长期进度推进
+                buildingEngine.processTick()
+                workshopEngine.processTick()
+                forgeEngine.processTick()
+                
+                // 步骤 D：层级 3 - 动态事件与经济流转
+                eventEngine.processTick()
+                marketEngine.processTick()
+                
+                // 步骤 E：层级 4 - 行为决策与结算
+                val curModifiers = policyEngine.getModifiers()
+                actionProcessor.processTick(curModifiers)
+                
+                // 步骤 F：层级 5 - 状态广播同步
+                entityState.emitStateDiff()
+                mapData.emitDirtyTiles()
+                
+            // 步骤 G：防爆网捕获收尾
+            } catch (t: Throwable) {
+                println("[COORD_ERROR] Subsystem crash isolated: ${t.message}")
+            }
+        }
+    }
+    
+    if (!activeJob.compareAndSet(null, newJob)) {
+        newJob.cancel()
+    }
+}
+```
+
+---
+
+## 3. 禁止事项（硬性约束）
+
+1. **异步并发抢占红线**：在推进 10 大下层组件的 `processTick` 与数据同步时，**绝对禁止使用 async/await、CoroutineScope.launch 或任何多线程异步并发**！必须前一个方法 100% 同步执行完毕，才可以调用下一行。一旦乱序，会引发严重的脏读与读写倒置异常，导致生产进度与消费行为脱节崩溃。
+
+2. **时钟断流死锁红线**：订阅闭包中**必须用 try-catch 包裹住全部 10 个子模块的完整执行链**！捕获所有的 `Throwable` 并进行日志记录，**绝对禁止向外投掷传播该异常**！如果向外抛出异常，会导致 Flow Collector 全面熔断断流，致使游戏全局时钟彻底永久死亡陷入死锁。
+
+3. **禁止省略任何层级**：5 大层级必须完整执行，禁止跳过任一 `processTick` 调用。
+
+---
+
+## 4. 测试规范：CoordinatorStrictPipelineTest.kt
+
+### 4.1 测试原则
+
+⚠️ 严格时序测试强制规则：必须使用 MockK 的 `verifyOrder` 精确锁定 10 个模块的调用顺序。
+
+### 4.2 测试用例
+
+**T01：十模块严格拓扑串行顺序调用测试**
+
+- 目的：验证 10 大模块严格按 5 层级顺序同步执行
+- 步骤：
+  1. Mock 全部 10 大子引擎与数据输出类，并对其 processTick 打桩
+  2. 触发一个心跳信号 tickFlow.emit(1001L)
+  3. 使用 MockK 的 verifyOrder 精确锁定调用顺序
+- 断言：必须强验证以下顺序（严格一字排开，没有任何异步乱序）：
+  1. weatherEngine.processTick() 被调用
+  2. policyEngine.processTick() 被调用
+  3. buildingEngine.processTick() 被调用
+  4. workshopEngine.processTick() 被调用
+  5. forgeEngine.processTick() 被调用
+  6. eventEngine.processTick() 被调用
+  7. marketEngine.processTick() 被调用
+  8. actionProcessor.processTick(any()) 被调用
+  9. entityState.emitStateDiff() 被调用
+  10. mapData.emitDirtyTiles() 被调用
+- 通过标准：verifyOrder 精确匹配
+
+**T02：防爆异常隔离流不断气回归测试**
+
+- 目的：验证异常隔离网彻底成功，Flow 管道没有被掐死
+- 步骤：
+  1. 设定 Mock 条件：当 buildingEngine.processTick() 执行时，故意强行抛出 RuntimeException("Subsystem Explosion") 毁灭崩溃异常
+  2. 触发第一个心跳 tickFlow.emit(1001L)
+- 断言 1：调度器并没有被此异常摧毁，控制台捕获并打印了 "[COORD_ERROR] Subsystem crash isolated: Subsystem Explosion"
+- 步骤：
+  1. 触发第二个心跳 tickFlow.emit(1002L)
+- 断言 2：weatherEngine.processTick() 依旧被新一轮顺畅触发！这证明异常隔离网彻底成功，Flow 管道没有被掐死，中央大循环毫发无损！
+- 通过标准：异常隔离成功，Flow 未断流
+
+**T03：ActionProcessor 接收最新 Modifiers 测试**
+
+- 目的：验证层级 4 正确提取并传递最新 Modifiers
+- 步骤：
+  1. Mock policyEngine.getModifiers() 返回固定 Map
+  2. 触发心跳
+- 断言：actionProcessor.processTick() 被调用，且参数等于 policyEngine.getModifiers() 的返回值
+- 通过标准：系数穿透正确
+
+**T04：异常后 Job 仍存活测试**
+
+- 目的：验证异常后 activeJob 仍持有有效 Job（未崩溃）
+- 步骤：
+  1. 触发会抛出异常的心跳
+  2. 捕获异常后，检查 activeJob.get() != null
+- 断言：activeJob.get()?.isActive == true（协程仍在运行）
+- 通过标准：Job 未崩溃
+
+---
+
+## 5. 测试框架要求
+
+- 使用 kotlin.test 断言库
+- 使用 MockK 进行打桩和 verifyOrder 验证
+- 每个测试方法独立，无执行顺序依赖
+- 禁止使用反射访问私有字段
+
+---
+
+## 6. 输出要求
+
+1. 仅输出 Kotlin 代码文件（GameLoopCoordinator.kt 扩展 + CoordinatorStrictPipelineTest.kt）
+2. 包含：collect 闭包内完整 5 层级串行管线、try-catch 防爆网、10 大模块严格顺序
+3. 不包含：Job 生命周期管理（已在 MDU 17.1 实现）、多线程并发优化
+4. 代码格式：遵循 Kotlin 官方约定
+
+---
+
+## 7. 模块边界说明
+
+**MDU 17.1（已完成）**：生命周期、DI、Job 原子操作
+**MDU 17.2（本章）**：严格串行管线、异常防爆网
+**MDU 17.3（后续）**：错误处理、异常恢复
+**MDU 17.4（后续）**：性能优化、语义冻结
+
+---
+
+## 8. 快速行为查阅
+
+**严格串行管线**：
+```
+tickFlow.collect { tickEvent ->
+  try {
+    // 层级 1
+    weatherEngine.processTick()   // 1
+    policyEngine.processTick()     // 2
+    
+    // 层级 2
+    buildingEngine.processTick()   // 3
+    workshopEngine.processTick()   // 4
+    forgeEngine.processTick()      // 5
+    
+    // 层级 3
+    eventEngine.processTick()      // 6
+    marketEngine.processTick()     // 7
+    
+    // 层级 4
+    val curModifiers = policyEngine.getModifiers()
+    actionProcessor.processTick(curModifiers)  // 8
+    
+    // 层级 5
+    entityState.emitStateDiff()    // 9
+    mapData.emitDirtyTiles()      // 10
+    
+  } catch (t: Throwable) {
+    println("[COORD_ERROR] ...")  // 捕获，不向外传播
+  }
+}
+```
+
+**异常隔离验证**：
+```
+心跳 1: tickFlow.emit(1001L)
+  → buildingEngine.processTick() 抛出 RuntimeException
+  → catch 捕获 → 打印 "[COORD_ERROR] Subsystem crash isolated: ..."
+  → Flow 未断流（未向外传播异常）
+
+心跳 2: tickFlow.emit(1002L)
+  → weatherEngine.processTick() 正常触发（证明 Flow 仍然存活）
+  → 所有 10 个模块按顺序执行
+```
+
+**verifyOrder 验证**：
+```
+verifyOrder {
+    weatherEngine.processTick()     // 1
+    policyEngine.processTick()      // 2
+    buildingEngine.processTick()    // 3
+    workshopEngine.processTick()    // 4
+    forgeEngine.processTick()       // 5
+    eventEngine.processTick()       // 6
+    marketEngine.processTick()      // 7
+    actionProcessor.processTick(any())  // 8
+    entityState.emitStateDiff()     // 9
+    mapData.emitDirtyTiles()       // 10
+}
+```

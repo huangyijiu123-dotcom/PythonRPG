@@ -1,0 +1,161 @@
+# MDU 6.2: 只读数据代理与动作代理基础快照 (MDU-B: Data & Action Proxies)
+
+作为 AI 编码助手，你的任务是构建 Kotlin 暴露给 Python 的“安全快照观察者”代理类，实现与内部 EntityStateManager 内存数据库的绝对只读隔离。
+
+---
+
+## 1. 核心代理快照数据契约 (Proxy Classes)
+
+在桥接器中定义以下只读快照代理类。为了与 Pythonic 属性命名兼容，所有内部属性强制转换为 Python 推荐的蛇形命名法（Snake Case）：
+
+```kotlin
+// 1. 仓库只读代理
+class WarehouseProxy(
+    val id: Long,
+    val x: Int,
+    val y: Int,
+    val capacity: Int,
+    val inventory: Map<String, Int> // 只读副本
+) {
+    val fill_level: Float get() = inventory.values.sum().toFloat() / capacity.coerceAtLeast(1)
+    fun stock(item: String): Int = inventory[item] ?: 0
+}
+
+// 2. 冒险者只读代理
+class AdventurerProxy(
+    val id: Long,
+    val name: String,
+    val x: Int,
+    val y: Int,
+    val hp: Int,
+    val max_hp: Int,
+    val attack_power: Int,
+    val defense: Int,
+    val agility: Int,
+    val level: Int,
+    val fatigue: Int,
+    val status: String
+)
+
+// 3. 突发事件只读代理
+class EventProxy(
+    val type: String,
+    val position_x: Int,
+    val position_y: Int,
+    val remaining_time: Int
+)
+
+// 4. 地图格子只读代理
+class TileProxy(
+    val x: Int,
+    val y: Int,
+    val terrain: String,
+    private val isLocked: Boolean,
+    private val isExplored: Boolean,
+    private val hasTreasure: Boolean
+) {
+    fun is_locked(): Boolean = isLocked
+    fun is_explored(): Boolean = isExplored
+    fun has_treasure(): Boolean = hasTreasure
+}
+
+// 5. 城邦只读代理（物价与饱和度动态拉取）
+class CityStateProxy(
+    val id: Long,
+    val name: String,
+    val x: Int,
+    val y: Int,
+    val city_type: String,
+    val inventory: Map<String, Int>,
+    @Transient private val marketEngine: Any // 动态依赖占位
+) {
+    fun get_price(item: String): Float = 1.0f // 下游具体调用 marketEngine 获取
+    fun get_supply_rate(item: String): Float = 1.0f
+}
+```
+
+### 携带动作的代理骨架定义：
+所有动作代理的写操作指令在调用时，**严禁直接修改内存状态**，必须打包成对应的 `PlayerCommand` 收集暂存至全局指令缓冲区 `commandBuffer` 中：
+
+```kotlin
+// 6. 村民只读兼动作代理
+class VillagerProxy(
+    val id: Long,
+    val name: String,
+    val x: Int,
+    val y: Int,
+    val energy: Int,
+    val status: String,
+    val current_job: String,
+    val backpack: Map<String, Int>, // 只读副本
+    private val equippedTools: Map<String, Int>,
+    @Transient private val commandBuffer: MutableList<PlayerCommand>
+) {
+    fun has_tool(tool_name: String): Boolean = equippedTools.containsKey(tool_name)
+    fun tool_durability(tool_name: String): Int = equippedTools[tool_name] ?: 0
+    val work_efficiency: Float get() = 1.0f // 综合效率折算
+    fun commute_time(target_x: Int, target_y: Int): Int = Math.abs(x - target_x) + Math.abs(y - target_y)
+}
+
+// 7. 商队只读兼动作代理
+class CaravanProxy(
+    val id: Long,
+    val name: String,
+    val x: Int,
+    val y: Int,
+    val capacity: Int,
+    val cargo: Map<String, Int>,
+    val status: String,
+    val target_x: Int,
+    val target_y: Int,
+    @Transient private val commandBuffer: MutableList<PlayerCommand>
+)
+
+// 8. 建筑只读兼动作代理
+class BuildingProxy(
+    val id: Long,
+    val type: String,
+    val x: Int,
+    val y: Int,
+    val level: Int,
+    val state: String,
+    val custom_data: Map<String, Any>,
+    @Transient private val commandBuffer: MutableList<PlayerCommand>
+)
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **绝对只读隔离红线 (No Shared Memory Mutations)**：
+   在所有 Proxy 类中，**所有的数据字段必须强制声明为只读的 `val`**。绝对不允许在任何 Proxy 内部声明 `var`，防止 Python 脚本直接对属性进行就地物理修改，保障宿主系统的内存安全隔离。
+2. **禁止循环引用与泄漏**：Proxy 只能存储快照数据副本，不能直接引用底层的 `Villager`、`Warehouse` 原始实体模型。
+
+### 机械式步骤指令：
+1. 创建以上的类，并确保打包后能够由 Chaquopy 机制顺畅通过反射或序列化形式访问其 `val` 属性。
+2. 构造快照映射引擎：编写将 `VillagerSnapshot` 投影为 `VillagerProxy` 的静态映射逻辑：
+   - 提取村民背包与装备工具 Map 副本，确保非引用共享。
+   - 传入共享的 `commandBuffer` 指令累加器。
+
+---
+
+## MDU 6.2-TEST: 快照代理只读完整性黑盒测试
+
+编写单元测试 `PythonProxySecurityTest.kt`。
+
+### 机械式测试用例：
+1. **只读保护与变量修改拦截测试**：
+   - 实例化 `WarehouseProxy`，传入库存 `{"WOOD" to 10}`，容量 100。
+   - 在 Kotlin 侧及反射场景下尝试对 `wh.capacity` 或 `wh.inventory` 进行覆写。
+   - **断言 1**：由于声明为 `val` 且没有 `set` 变写入口，编译器强制拦截拒绝编译。
+   - 模拟在 Python 环境下尝试调用反射或对 `wh.capacity = 500` 进行赋值。
+   - **断言 2**：Python 抛出 AttributeError 异常（因为 val 字段在 Java/Chaquopy 侧未生成 setter），物理防护有效。
+2. **蛇形命名与数据转换精度测试**：
+   - 构造冒险者快照并投影为 `AdventurerProxy`，传入 hp = 80, maxHp = 100。
+   - **断言 1**：`max_hp`（蛇形命名属性）的只读读取逻辑成功映射，并精准等于 `100`。
+   - **断言 2**：`fill_level` 动态属性在库存 50、容量 200 时计算，精准等于 `0.25f`（无整型截断误差）。
+
+### 交付物：
+只包含 8 个快照与动作代理类定义、蛇形属性映射方法、及反射写修改拦截的 JUnit 测试用例。不含 AST 检查、全局 Context 字典及动作指令方法体实现。

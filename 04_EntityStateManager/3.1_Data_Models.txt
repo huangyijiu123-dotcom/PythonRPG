@@ -1,0 +1,406 @@
+# MDU 3.1: 数据模型、存储容器与全局资源
+
+## 任务目标
+
+为 `EntityStateManager` 搭建贫血模型的基础数据结构、并发安全内部容器、全局金币资源控制 API 以及基础 CRUD 接口。
+
+**输出标准**：代码必须通过 Kotlin 编译，所有容器使用 `ConcurrentHashMap`，金币更新使用 CAS 原子操作，测试为纯黑盒。
+
+---
+
+## 1. 核心数据契约（不可更改字段名与类型）
+
+在同一文件内定义以下类型：
+
+### 1.1 VillagerStatus 枚举
+
+```kotlin
+enum class VillagerStatus {
+    RESTING,      // 休息中（在民房内）
+    MOVING,       // 行进中（前往工作点或仓库）
+    WORKING,      // 工作中（采集资源）
+    DELIVERING,   // 交付中（前往仓库交付资源）
+    EQUIPPING     // 换装中（前往仓库换工具，特殊锁定状态）
+}
+```
+
+### 1.2 VillagerSnapshot 数据类
+
+```kotlin
+data class VillagerSnapshot(
+    val id: Long,
+    val name: String,
+    val x: Int,
+    val y: Int,
+    val energy: Int,                    // 体力值，范围 0..100
+    val status: VillagerStatus,         // 当前状态
+    val currentJob: String,             // 岗位字符串，如 "WOODCUTTING"
+    val workTargetX: Int?,              // 工作点 X 坐标（无工作时为 null）
+    val workTargetY: Int?,              // 工作点 Y 坐标
+    val cottageId: Long,                // 所属民房的 ID
+    val backpack: Map<String, Int>,     // 背包物资，如 {"WOOD" to 12}
+    val equippedTools: Map<String, Int>, // 已装备工具及耐久度
+    val isInjured: Boolean              // 是否处于"重伤"状态
+)
+```
+
+### 1.3 AdventurerStatus 枚举
+
+```kotlin
+enum class AdventurerStatus {
+    IDLE,       // 闲置
+    MOVING,     // 行进中
+    FIGHTING,   // 战斗中
+    ESCORTING,  // 护卫中（跟随商队）
+    RECOVERING  // 疗伤中
+}
+```
+
+### 1.4 AdventurerSnapshot 数据类
+
+```kotlin
+data class AdventurerSnapshot(
+    val id: Long,
+    val name: String,
+    val x: Int,
+    val y: Int,
+    val hp: Int,
+    val maxHp: Int,
+    val attackPower: Int,
+    val defense: Int,
+    val agility: Int,
+    val level: Int,
+    val fatigue: Int,               // 疲劳值，范围 0..100
+    val status: AdventurerStatus,
+    val mp: Int,                    // 玩家 MP（领主全局资源）
+    val quality: Int,               // 品质等级
+    val weaponId: Long?,            // 装备武器 ID
+    val armorId: Long?,             // 装备防具 ID
+    val skills: List<String>        // 技能列表
+)
+```
+
+### 1.5 CaravanStatus / CaravanMode 枚举
+
+```kotlin
+enum class CaravanStatus {
+    STANDBY,        // 待命
+    TRADING,        // 交易中
+    TRANSPORTING,   // 运输中
+    RAIDED          // 被劫掠
+}
+
+enum class CaravanMode {
+    TRADE,              // 贸易模式
+    INTERNAL_TRANSPORT  // 内部运输
+}
+```
+
+### 1.6 CaravanSnapshot 数据类
+
+```kotlin
+data class CaravanSnapshot(
+    val id: Long,
+    val name: String,
+    val x: Int,
+    val y: Int,
+    val capacity: Int,              // 最大载货量
+    val cargo: Map<String, Int>,    // 当前货物
+    val status: CaravanStatus,
+    val mode: CaravanMode,
+    val targetX: Int?,
+    val targetY: Int?,
+    val escortAdventurerId: Long?   // 护卫冒险者 ID
+)
+```
+
+### 1.7 WarehouseType 枚举
+
+```kotlin
+enum class WarehouseType {
+    LOCAL,          // 地方仓库（容量 500）
+    DISTRIBUTION,   // 分拨中心（容量 2000，辐射半径 3~5 格）
+    ROYAL           // 王城仓库（容量 5000+，坐标固定为 0,0）
+}
+```
+
+### 1.8 WarehouseSnapshot 数据类
+
+```kotlin
+data class WarehouseSnapshot(
+    val id: Long,
+    val x: Int,
+    val y: Int,
+    val warehouseType: WarehouseType,
+    val capacity: Int,
+    val inventory: Map<String, Int>     // 各物资当前库存量
+)
+```
+
+### 1.9 EquipmentClass 枚举
+
+```kotlin
+enum class EquipmentClass {
+    WEAPON,     // 武器
+    ARMOR       // 防具
+}
+```
+
+### 1.10 EquipmentSnapshot 数据类
+
+```kotlin
+data class EquipmentSnapshot(
+    val id: Long,
+    val templateId: String,         // 装备模板 ID
+    val equipmentClass: EquipmentClass,
+    val level: Int,                 // 强化等级 0~10
+    val durability: Int,            // 当前耐久
+    val maxDurability: Int,         // 最大耐久
+    val baseAttack: Int,            // 基础攻击
+    val baseDefense: Int,           // 基础防御
+    val ownerId: Long?              // 所属冒险者 ID
+)
+```
+
+---
+
+## 2. 类骨架与并发容器
+
+### 2.1 骨架声明
+
+```kotlin
+class EntityStateManager {
+    // 并发安全存储容器（见 2.2）
+    // 全局金币原子变量（见 2.3）
+    // 基础 CRUD API（见 3）
+    // 禁止：协程循环、AI 决策、寻路计算、自动移动逻辑
+}
+```
+
+### 2.2 并发线程安全容器
+
+**villagers**：ConcurrentHashMap<Long, VillagerSnapshot>() — 村民快照存储
+**adventurers**：ConcurrentHashMap<Long, AdventurerSnapshot>() — 冒险者快照存储
+**equipments**：ConcurrentHashMap<Long, EquipmentSnapshot>() — 装备快照存储
+**caravans**：ConcurrentHashMap<Long, CaravanSnapshot>() — 商队快照存储
+**warehouses**：ConcurrentHashMap<Long, WarehouseSnapshot>() — 仓库快照存储
+
+### 2.3 全局金币原子容器
+
+```kotlin
+private val playerGold = AtomicInteger(0)
+```
+
+---
+
+## 3. 基础 CRUD API
+
+### 3.1 注册方法
+
+**registerVillager(v: VillagerSnapshot)**：villagers[v.id] = v
+**registerAdventurer(a: AdventurerSnapshot)**：adventurers[a.id] = a
+**registerEquipment(eq: EquipmentSnapshot)**：equipments[eq.id] = eq
+**registerCaravan(c: CaravanSnapshot)**：caravans[c.id] = c
+**registerWarehouse(w: WarehouseSnapshot)**：warehouses[w.id] = w
+
+**行为约束**：
+- 直接存入对应 ConcurrentHashMap，覆盖已有键值
+- 无返回值
+- 线程安全由 ConcurrentHashMap 保证
+
+### 3.2 获取方法
+
+**getVillager(id: Long): VillagerSnapshot?**：villagers[id]
+**getAdventurer(id: Long): AdventurerSnapshot?**：adventurers[id]
+**getEquipment(id: Long): EquipmentSnapshot?**：equipments[id]
+**getCaravan(id: Long): CaravanSnapshot?**：caravans[id]
+**getWarehouse(id: Long): WarehouseSnapshot?**：warehouses[id]
+
+**行为约束**：
+- 返回快照对象引用（只读，外部不可修改内部状态）
+- id 不存在时返回 null
+
+### 3.3 全量获取方法
+
+**getAllVillagers(): List<VillagerSnapshot>**：villagers.values.toList()
+**getAllAdventurers(): List<AdventurerSnapshot>**：adventurers.values.toList()
+**getAllEquipments(): List<EquipmentSnapshot>**：equipments.values.toList()
+**getAllCaravans(): List<CaravanSnapshot>**：caravans.values.toList()
+**getAllWarehouses(): List<WarehouseSnapshot>**：warehouses.values.toList()
+
+**行为约束**：
+- 返回不可变的 List 副本，禁止直接返回内部 Map 的 values 引用
+- 使用 toList() 创建防御性拷贝
+
+### 3.4 过滤方法
+
+**filterVillagers(predicate: (VillagerSnapshot) -> Boolean): List<VillagerSnapshot>**：villagers.values.filter(predicate)
+**filterAdventurers(predicate: (AdventurerSnapshot) -> Boolean)**：同上模式
+
+**行为约束**：
+- 返回过滤后的 List 副本
+- predicate 在遍历期间执行，遍历完成后返回结果
+
+### 3.5 删除方法
+
+**removeVillager(id: Long): Boolean**：villagers.remove(id) != null
+**removeAdventurer(id: Long): Boolean**：adventurers.remove(id) != null
+**removeEquipment(id: Long): Boolean**：equipments.remove(id) != null
+**removeCaravan(id: Long): Boolean**：caravans.remove(id) != null
+**removeWarehouse(id: Long): Boolean**：warehouses.remove(id) != null
+
+**行为约束**：
+- 返回 Boolean 表示是否成功删除（id 存在返回 true，不存在返回 false）
+- 删除后立即不可通过 get 查询到
+
+---
+
+## 4. 全局金币操作 API
+
+### 4.1 getPlayerGold(): Int
+
+**签名**：fun getPlayerGold(): Int
+
+**返回值**：当前玩家金币数量
+
+**原子性**：读取 AtomicInteger 的当前值，无锁
+
+### 4.2 updatePlayerGold(delta: Int): Boolean
+
+**签名**：fun updatePlayerGold(delta: Int): Boolean
+
+**功能**：原子更新玩家金币数量
+
+**实现**：
+```kotlin
+fun updatePlayerGold(delta: Int): Boolean {
+    while (true) {
+        val current = playerGold.get()
+        val next = current + delta
+        if (next < 0) return false
+        if (playerGold.compareAndSet(current, next)) return true
+    }
+}
+```
+
+**行为约束**：
+- 使用 CAS 循环确保原子性
+- delta 为负数时扣除金币，若扣除后小于 0 则返回 false 且不修改
+- delta 为正数时直接增加
+- 并发调用时通过 CAS 重试保证最终一致性
+
+**返回值**：
+- true：更新成功
+- false：扣除后金币不足，未执行修改
+
+---
+
+## 5. 禁止事项（硬性约束）
+
+1. **禁止越界常识业务**：本模块是纯粹的内存型贫血数据库，严禁引入任何自动移动、寻路计算、AI 决策或时钟/协程循环
+2. **禁止直接返回内部可变数据**：返回 List 或 Map 时必须使用 toList() 或 toMap() 创建防御性拷贝
+3. **禁止非线程安全修改金币**：全局金币修改严禁直接 gold += delta，必须使用 CAS 循环
+4. **禁止反射访问**：单元测试禁止通过反射读取内部 ConcurrentHashMap
+
+---
+
+## 6. 测试规范：EntityStateManagerBaseTest.kt
+
+### 6.1 测试原则
+
+⚠️ 黑盒测试强制规则：禁止使用反射或访问内部容器字段。所有验证必须通过公开 API 反映。
+
+### 6.2 测试用例
+
+**T01：基础 CRUD 注册获取测试**
+
+- 目的：验证实体的注册、获取、全量获取和删除
+- 步骤：
+  1. 实例化 EntityStateManager
+  2. 断言 getAllVillagers() 大小为 0
+  3. 注册 VillagerSnapshot(id=1, name="张三", ...)
+  4. 断言 getVillager(1)?.name == "张三"
+  5. 断言 getAllVillagers() 大小为 1
+  6. 调用 removeVillager(1)，断言返回 true
+  7. 断言 getVillager(1) 返回 null
+- 通过标准：所有断言通过
+
+**T02：全局金币原子更新与边界测试**
+
+- 目的：验证金币 CAS 更新的原子性和边界保护
+- 步骤：
+  1. 实例化 EntityStateManager，默认金币为 0
+  2. updatePlayerGold(100) → 断言返回 true，getPlayerGold() == 100
+  3. updatePlayerGold(-40) → 断言返回 true，getPlayerGold() == 60
+  4. updatePlayerGold(-100) → 断言返回 false
+  5. 断言 getPlayerGold() 仍为 60（扣除不足时安全回滚）
+- 通过标准：边界保护正确，状态不回滚
+
+**T03：全局金币高并发安全测试**
+
+- 目的：验证 100 协程并发修改金币无状态丢失
+- 步骤：
+  1. 初始金币设为 1000
+  2. 启动 50 个协程并行调用 updatePlayerGold(1)
+  3. 启动 50 个协程并行调用 updatePlayerGold(-1)
+  4. 等待所有协程结束
+  5. 断言 getPlayerGold() 严格等于 1000
+- 通过标准：无并发状态丢失
+
+---
+
+## 7. 测试框架要求
+
+- 使用 kotlin.test 断言库
+- 并发测试使用 kotlinx.coroutines 协程
+- 每个测试方法独立，无执行顺序依赖
+- 禁止使用反射访问私有字段
+
+---
+
+## 8. 输出要求
+
+1. 仅输出 Kotlin 代码文件（EntityStateManager.kt + EntityStateManagerBaseTest.kt）
+2. 包含：所有数据类声明、CRUD API、全局金币 CAS 逻辑
+3. 不包含：业务逻辑、协程循环、AI 决策、寻路计算
+4. 代码格式：遵循 Kotlin 官方约定
+
+---
+
+## 9. 快速行为查阅
+
+**注册时序**：
+```
+registerVillager(v)
+  → villagers[v.id] = v
+  → 立即返回，覆盖已有值
+```
+
+**获取时序**：
+```
+getVillager(id)
+  → villagers[id]
+  → 返回快照引用或 null
+```
+
+**金币更新时序**：
+```
+updatePlayerGold(delta)
+  → while(true) { current = get(); next = current + delta; if (next < 0) return false; if (CAS(current, next)) return true }
+  → 失败时重试，负数时拒绝
+```
+
+**删除时序**：
+```
+removeVillager(id)
+  → villagers.remove(id) != null
+  → 返回 Boolean
+```
+
+---
+
+## 10. 模块边界说明
+
+**MDU 3.1（本章）**：数据模型、并发容器、基础 CRUD、全局金币 CAS
+**MDU 3.2（下一模块）**：属性级局部更新、脏标记与变更通知机制
+**MDU 3.3（后续）**：事务操作、批量更新、序列化机制

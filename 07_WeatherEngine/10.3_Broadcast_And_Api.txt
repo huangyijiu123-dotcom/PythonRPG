@@ -1,0 +1,65 @@
+# MDU 10.3: 天气强制覆盖命令与 SharedFlow 广播引擎 (MDU-C: Broadcast & Overrides)
+
+作为 AI 天气模拟与架构专家，你的任务是为天气引擎实现热更管理、管理员 GM 强制修改天气接口，并通过并发安全的 `SharedFlow` 向上层 UI 和声音引擎实时广播气候变迁事件。
+
+---
+
+## 1. 强制覆盖与事件广播契约 (Interface Contract)
+
+在 `WeatherEngine` 中声明并实现强制设置及事件分发通道属性（支持防高频冗余触发）：
+
+```kotlin
+// 天气变迁 SharedFlow 广播流，供外部 UI、UI音效、AI决策层订阅监听天候改变
+// 触发机制：仅当天气确实从 A 变迁为 B 时抛出，避免多线程冗余广播
+val weatherEventFlow: SharedFlow<WeatherType>
+
+// 强制切换天气（管理员调试、特殊副本剧情或突发全局战役剧情需要）
+// 直接覆盖状态机并清空原有倒计时，立即生效并广播事件
+fun forceSetWeather(type: WeatherType, durationTicks: Int)
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **高频冗余广播污染红线 (No Redundant Event Emits)**：
+   若当前已经是 `WeatherType.RAIN`（暴雨），**绝对禁止再次在 Flow 中发出 `RAIN` 冗余事件**！所有广播机制必须配备“异色判定哨兵”（即只有 `newWeather != oldWeather` 时才触发 `tryEmit`），严禁无谓消耗 CPU 及网络带宽。
+2. **禁止时长越轨**：forceSetWeather 传入的持续时长 durationTicks 必须 $\ge 1$，否则立刻抛出 `IllegalArgumentException` 守护时长合法性。
+
+### 机械式步骤指令：
+1. **构造并发事件广播通道 (`weatherEventFlow`)**：
+   - 内部定义为热流：
+     `private val _weatherEventFlow = MutableSharedFlow<WeatherType>(replay = 0, extraBufferCapacity = 8, onBufferOverflow = BufferOverflow.DROP_OLDEST)`
+   - 公开暴露为只读：
+     `val weatherEventFlow: SharedFlow<WeatherType> = _weatherEventFlow`
+2. **重构流转与覆盖逻辑以对接事件广播**：
+   - **重构 `processTick`（由 10.2 提供）**：在 CAS 更新成功后，若发现 `nextVal.current != currentVal.current`，必须就地执行 `_weatherEventFlow.tryEmit(nextVal.current)` 广播出去。
+   - **实现强制设置 (`forceSetWeather`)**：
+     - 校验传入时长：`require(durationTicks >= 1) { "持续时钟必须大于零！" }`
+     - 步骤 A：获取旧天气快照 `val oldVal = state.get()`。
+     - 步骤 B：构造强制新状态 `val newVal = WeatherState(type, durationTicks)`。
+     - 步骤 C：执行原子更新：`state.set(newVal)`。
+     - 步骤 D：**异色哨兵拦截广播**：若 `type != oldVal.current`，触发广播调用 `_weatherEventFlow.tryEmit(type)`，向全服宣告气候骤变。
+
+---
+
+## MDU 10.3-TEST: 管理员天候覆盖与异色广播熔断黑盒测试
+
+编写单元测试 `WeatherOverrideAndBroadcastTest.kt`。
+
+### 机械式测试用例：
+1. **管理员剧情天候覆盖测试**：
+   - 当前处于默认晴天 `CLEAR`，倒计时 10。
+   - 调用 `forceSetWeather(WeatherType.COLD_WAVE, 24)`（强制转为寒潮并维持一天 24 ticks）。
+   - **断言 1**：立刻查询 `getCurrentWeather()`，天候精准更新为 `COLD_WAVE`，且 ticksRemaining 严格等于 `24`。
+   - **断言 2**：调用 `getModifiers()`，体力消耗倍率 `energyCostMultiplier` 立即同步变化为寒潮对应的 `1.5f`。
+2. **异色事件流广播去重校验测试**：
+   - 监听并订阅 `weatherEventFlow` 捕获队列。
+   - 当前天候为阴天 `OVERCAST`。调用 `forceSetWeather(WeatherType.OVERCAST, 10)`（强制设置同色天气）。
+   - **断言 1**：Flow 收集器中**未收到任何新事件**，去重拦截哨兵完美守护。
+   - 调用 `forceSetWeather(WeatherType.RAIN, 10)`（切为异色暴雨）。
+   - **断言 2**：Flow 收集器成功接获一条天候变为 `RAIN` 的全局广播，没有丢失。
+
+### 交付物：
+只包含 `forceSetWeather` 写入逻辑、SharedFlow 公开定义与 CAS 原子重构、以及天候强制覆盖与广播去重 JUnit 单元测试代码。不含具体系数配置字典及 processTick 大脑运转。

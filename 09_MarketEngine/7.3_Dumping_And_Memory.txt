@@ -1,0 +1,71 @@
+# MDU 7.3: 反恶意薅羊毛倾销判定与城邦记忆引擎 (MDU-C: Dumping & City Memory)
+
+作为 AI 经济学工程师，你的任务是为 `MarketEngine` 植入反玩家高频超量倾销薅羊毛的安全保护屏障，并建立具有存档持久化修改力的“城邦记忆机制”。
+
+---
+
+## 1. 核心倾销与记忆接口契约 (Interface Contract)
+
+在经济管理器中声明并实现以下防倾销判定及历史滑窗清理接口（包含具体的私有惩罚执行层）：
+
+```kotlin
+// 预判接口：判定如果在本 Tick 卖出 amount 数量的 item，是否会诱发城邦倾销拦截
+// 供商队在准备交易前以及玩家脚本逻辑预估时调用
+fun willTriggerDumping(cityId: Long, item: String, amount: Int, currentTickId: Long): Boolean
+
+// 每 Tick 时钟清理历史：清除已经超过 5 Tick 期限的过期老交易流水
+fun cleanupTradeHistory(cityId: Long, currentTickId: Long)
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **持久化永久性篡改红线 (Irreversible Modifiers)**：
+   一旦对某种物资的累计倾销次数达到 3 次或 5 次，对 `basePrices`（基准价格）或 `dailyConsumptionRate`（日常消耗率）的永久性削减**必须是就地不可逆修改**的（写入快照快照 Data 并跟随存档持久化），严禁只做单次运算衰减。
+2. **禁止参数错配**：倾销判定时间跨度必须是包含本 Tick 过去 5 个 Tick（即 `record.tickId >= currentTickId - 5`）的水准。
+
+### 机械式步骤指令：
+1. **实现预判倾销逻辑 (`willTriggerDumping`)**：
+   - 步骤 A：定位城邦。若不存在返回 `false`。
+   - 步骤 B：**单次倾销阈值校验**：若本次单次卖出量 $amount > \text{maxCapacity} \times 0.2$（即超过容量的 20%），直接触发，返回 `true`。
+   - 步骤 C：**滑窗累计阈值校验**：
+     - 过滤并累加 `city.tradeHistory` 中：时间在 $\ge \text{currentTickId} - 5$ 之间、物资产量是当前 `item`、且交易方向为 `TradeDirection.SELL`（正数卖出）的累计成交总量 $V_{sum}$。
+     - 若 $V_{sum} + amount > \text{maxCapacity} \times 0.3$（即 5 ticks 内卖出超过 30% 总量），返回 `true`。
+   - 步骤 D：未满足上述两项返回 `false`。
+2. **实现惩罚执行器 `applyDumpingPenalty(city: CityStateData, item: String)`**（内部私有方法，由结算 Sell 触发调用）：
+   - 步骤 A：玩家信誉扣减：`city.reputation -= 0.2f` 并 `coerceIn(-0.5f, 1.0f)` 截断。若新信誉度 $< -0.3f$，强制标记 `city.isSuspended = true`（立即暂停挂牌交易）。
+   - 步骤 B：增加该物资在 `dumpingCounts` 中的累计倾销计数：
+     `val count = (city.dumpingCounts[item] ?: 0) + 1; city.dumpingCounts[item] = count`
+   - 步骤 C：**城邦记忆机制触发**：
+     - 若 `count >= 3`（永久性压低单价 10%）：将 $basePrices[item]$ 削减为原本的 $0.9$ 倍。
+     - 若 `count >= 5`（永久性放缓消耗速率 20%）：将 $dailyConsumptionRate[item]$ 降为原本的 $0.8$ 倍（库存消化变慢，价格长期低迷）。
+3. **实现历史垃圾回收 (`cleanupTradeHistory`)**：
+   - 定位城邦。调用 `city.tradeHistory.removeIf { it.tickId < currentTickId - 5 }`，防止交易历史产生内存爆炸。
+
+---
+
+## MDU 7.3-TEST: 倾销滑窗拦截与城邦记忆惩罚黑盒测试
+
+编写单元测试 `MarketEngineDumpingTest.kt`。
+
+### 机械式测试用例：
+1. **单次量过载倾销触发测试**：
+   - 注册容量为 1000 的城邦，初始无交易记录。
+   - 调用 `willTriggerDumping(cityId = 1, item = "WOOD", amount = 201, currentTickId = 10)`（单次卖出 201，超过 20% 限幅）。
+   - **断言**：方法返回 `true`（触发倾销）。
+2. **5 Tick 滑窗累计倾销触发测试**：
+   - 在 tick = 10 时，写入一条 tradeHistory 记录：`amount = 150`, SELL, item = "WOOD"。
+   - 在 tick = 12 时，调用 `willTriggerDumping(cityId = 1, item = "WOOD", amount = 160, currentTickId = 12)`（两次交易合计 310，超过 30% 限幅）。
+   - **断言 1**：方法返回 `true`。
+   - 若调用 `cleanupTradeHistory(1, currentTickId = 16)`，再次进行同样预判。
+   - **断言 2**：由于历史记录已失效清理，新预判返回 `false`，证明历史清理和滑动窗口有效。
+3. **三次倾销基准价永久降价测试**：
+   - 模拟对城邦 1 的 `"STONE"` 连续执行 3 次 `applyDumpingPenalty`。基准价初始为 100.0f。
+   - **断言 1**：基准价格字典中，该物资的价格已被不可逆削减为 `90.0f`。
+   - 模拟执行到 5 次。
+   - **断言 2**：日常自然消耗速率已扣减 20%（永久乘 0.8），且在持久存档导出中该被篡改的值被完整保留。
+
+### 交付物：
+只包含 `willTriggerDumping` 校验方法、私有 `applyDumpingPenalty` 长期记忆永久降价写入实现、`cleanupTradeHistory` 垃圾清理方法、以及倾销机制与记忆的 JUnit 单元测试。不含任何实际买卖结算 API 及 processDailyConsumption。

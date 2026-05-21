@@ -1,0 +1,126 @@
+# MDU 5.1: 基础总线、派发器与指令分发骨架 (MDU-A: Event Bus, Dispatcher & Core Architecture)
+
+作为 AI 编码助手，你的首要任务是为连接游戏“时钟周期”与“内存状态”的中央处理器 `ActionProcessor` 搭建“非上帝类”的解耦派发总线骨架，确立高内聚低耦合的 Command/Event 架构体系。
+
+---
+
+## 1. 核心接口与数据契约 (Interface & Data Contract)
+
+在模块中定义底层核心派发接口、指令总线、事件流及基类骨架（不得缺失任何已定义类型）：
+
+```kotlin
+// 游戏周期自转驱动系统接口（村民自动化、战斗等挂载其下）
+interface ITickableSystem {
+    fun processTick(tickId: Long, weatherModifier: WeatherModifiers, policyModifier: PolicyModifiers)
+}
+
+// 玩家/脚本指令处理器抽象接口（具体领域的指令消费处理器实现它）
+interface CommandHandler {
+    fun canHandle(command: PlayerCommand): Boolean
+    fun handle(command: PlayerCommand)
+}
+
+// 静态依赖：游戏时限或天气法令影响的占位结构（下游开发具体字段）
+data class WeatherModifiers(val energyCostMultiplier: Float = 1.0f)
+data class PolicyModifiers(val energyCostMultiplier: Float = 1.0f, val harvestYieldMultiplier: Float = 1.0f)
+```
+
+### 完整声明 `PlayerCommand` 密封类家族：
+```kotlin
+sealed class PlayerCommand {
+    data class AssignJob(val villagerId: Long, val job: String, val targetX: Int, val targetY: Int) : PlayerCommand()
+    data class ReturnHome(val villagerId: Long) : PlayerCommand()
+    data class EquipTool(val villagerId: Long, val toolId: String, val warehouseId: Long) : PlayerCommand()
+    data class DispatchAdventurer(val adventurerId: Long, val targetX: Int, val targetY: Int) : PlayerCommand()
+    data class RecallAdventurer(val adventurerId: Long) : PlayerCommand()
+    data class AssignCaravanTarget(val caravanId: Long, val targetX: Int, val targetY: Int) : PlayerCommand()
+    data class StartCaravan(val caravanId: Long) : PlayerCommand()
+    data class RecallCaravan(val caravanId: Long) : PlayerCommand()
+    data class TradeWithCityState(val caravanId: Long, val cityId: Long, val isBuy: Boolean, val item: String, val amount: Int) : PlayerCommand()
+    data class BuildBuilding(val x: Int, val y: Int, val buildingType: String) : PlayerCommand()
+    data class UpgradeBuilding(val x: Int, val y: Int) : PlayerCommand()
+    object RecruitVillager : PlayerCommand()
+    object RecruitAdventurer : PlayerCommand()
+    data class ResolveEvent(val eventId: Long) : PlayerCommand()
+    data class QueueProduction(val workshopId: Long, val toolType: String, val count: Int) : PlayerCommand()
+    data class ForgeEquipment(val templateId: String) : PlayerCommand()
+    data class UpgradeEquipment(val equipmentId: Long) : PlayerCommand()
+    data class RepairEquipment(val equipmentId: Long) : PlayerCommand()
+    data class DismantleEquipment(val equipmentId: Long) : PlayerCommand()
+    data class RepairAllEquipment(val adventurerId: Long) : PlayerCommand()
+    data class StartResearch(val techId: String) : PlayerCommand()
+    data class EnactPolicy(val policyType: String, val isActive: Boolean) : PlayerCommand()
+}
+```
+
+### 完整声明 `GameEvent` 密封类家族：
+```kotlin
+sealed class GameEvent {
+    data class VillagerMoved(val villagerId: Long, val toX: Int, val toY: Int) : GameEvent()
+    data class VillagerHarvested(val villagerId: Long, val item: String, val amount: Int) : GameEvent()
+    data class VillagerDelivered(val villagerId: Long, val warehouseId: Long, val items: Map<String, Int>) : GameEvent()
+    data class VillagerToolBroken(val villagerId: Long, val toolId: String) : GameEvent()
+    data class VillagerLowEnergy(val villagerId: Long, val energy: Int) : GameEvent()
+    data class VillagerReturningHome(val villagerId: Long, val reason: String) : GameEvent() // "TWILIGHT" | "LOW_ENERGY"
+    data class AdventurerMoved(val adventurerId: Long, val toX: Int, val toY: Int) : GameEvent()
+    data class AdventurerReachedTarget(val adventurerId: Long, val x: Int, val y: Int) : GameEvent()
+    data class CombatTriggered(val adventurerId: Long, val monsterTypeId: String, val atX: Int, val atY: Int) : GameEvent()
+    data class CaravanMoved(val caravanId: Long, val toX: Int, val toY: Int) : GameEvent()
+    data class CaravanTradeResult(val caravanId: Long, val cityId: Long, val isBuy: Boolean, val item: String, val amount: Int, val goldDelta: Int) : GameEvent()
+    data class WarehouseFull(val warehouseId: Long, val fillRatio: Float) : GameEvent()
+    data class TickProcessed(val tickId: Long, val eventCount: Int) : GameEvent()
+}
+```
+
+---
+
+## 2. 机械式步骤指令与禁止事项
+
+### 禁止事项：
+1. **绝对禁止出现上帝类 $when(command)$ 条件匹配红线 (No God Class Branching)**：
+   在 `ActionProcessor` 核心结算循环内部，**绝对不允许**直接编写巨型分支去解析指令。
+   例如：`when(cmd) { is AssignJob -> ... is BuildBuilding -> ... }` 是高耦合禁忌。所有指令派发必须遍历注册的 `CommandHandler` 列表，调用 `canHandle` 认领消费。
+2. **禁止在结算循环中中途修改指令队列**：必须使用并发队列 `ConcurrentLinkedQueue` 进行缓冲隔离。指令的 `enqueueCommand` 可由 UI/脚本线程随时调用，而结算必须在 Tick 协程中原子清空消费，保障线程隔离。
+
+### 机械式步骤指令：
+1. 创建 `class ActionProcessor` 主体类，注入 `TickEngine` 等外部引擎（初始框架中仅以占位形式接收，下游逐步充实）。
+2. 在类内定义并发安全的指令队列和事件广播流：
+   - 指令缓冲队列：`private val commandQueue = ConcurrentLinkedQueue<PlayerCommand>()`
+   - 外部事件流：`private val _eventFlow = MutableSharedFlow<List<GameEvent>>(replay = 0, extraBufferCapacity = 10, onBufferOverflow = BufferOverflow.DROP_OLDEST)`
+     暴露为只读：`val eventFlow = _eventFlow.asSharedFlow()`
+3. 定义私有容器挂载处理器和自转系统：
+   - `private val commandHandlers = CopyOnWriteArrayList<CommandHandler>()`
+   - `private val tickableSystems = CopyOnWriteArrayList<ITickableSystem>()`
+   - 提供注册入口：`fun registerHandler(handler: CommandHandler)`，`fun registerSystem(system: ITickableSystem)`。
+4. 定义事件暂存累加容器：每次 Tick 结算各组件可往内部抛事件，由主处理器最后统一广播。
+   - `private val pendingEvents = ConcurrentLinkedQueue<GameEvent>()`
+   - 提供事件抛掷 API（供 Handlers 和 Systems 写入）：`fun postEvent(event: GameEvent) = pendingEvents.add(event)`
+5. 实现事件处理核心大循环 `processTickStep(tickId: Long)`：
+   - 步骤 A：**消化外部指令**。从 `commandQueue` 中循环取出所有指令，对每个指令遍历 `commandHandlers`，匹配 `canHandle(cmd) == true` 的处理器并执行 `handle(cmd)`。
+   - 步骤 B：**推进世界自转**。读取天气 `weatherEngine.getModifiers()` 与法令 `policyEngine.getModifiers()`（占位逻辑直接传默认值），遍历调用 `tickableSystems.processTick(tickId, weather, policy)`。
+   - 步骤 C：**批量分发事件**。将本 Tick 收集在 `pendingEvents` 中的所有事件整理为 List，若非空则调用 `_eventFlow.tryEmit(eventList)`。最后调用 `pendingEvents.clear()` 彻底重置。
+6. 实现生命周期挂载 `start()` 和 `stop()`：
+   - `start()` 中订阅 `tickEngine.tickFlow`，启动协程监听，并在收到 `TickEvent` 时调用 `processTickStep(event.tickId)`。使用 Job 进行生命周期管理，确保可被原子 `cancel()`。
+
+---
+
+## MDU 5.1-TEST: 总线分发与防并发炸弹黑盒测试
+
+编写单元测试 `ActionProcessorDispatcherTest.kt`。
+
+### 机械式测试用例：
+1. **指令分发解耦（Dispatcher 纯洁性）校验**：
+   - 编写假指令 `class FakeTestCommand : PlayerCommand()`（作为密封类的子类或单独构造）。
+   - 编写假处理器 `class FakeHandler : CommandHandler`：记录收到 Fake 指令的次数。
+   - 注册该 Fake 处理器，调用 `enqueueCommand(FakeTestCommand)`。
+   - 推进一次游戏 Tick `processTickStep(1)`。
+   - **断言**：假处理器收到的指令计数为 1，证明总线派发成功，且 `ActionProcessor` 内部没有任何死绑定或 `when` 硬编码。
+2. **多线程指令排队与防 ConcurrentModification 并发校验**：
+   - 实例化 `ActionProcessor` 并启动。
+   - 启动 50 个高并发协程，每个协程连续向 `commandQueue` 中快速 `enqueueCommand` 不同的测试指令共 20 次（累计 1000 个指令）。
+   - 推进一次 Tick 结算。
+   - **断言 1**：大循环在并发写入和内部读写消费交织下平稳度过，**未抛出任何并发修改异常**。
+   - **断言 2**：队列最终被彻底清空，积压指令数为 0。
+
+### 交付物：
+只包含基础数据结构、核心派发骨架、队列与事件流声明、`start/stop` 生命周期和总线派发及并发冲突防爆的黑盒测试。不包含任何具体的村民状态机或跨模块结算逻辑。

@@ -1,0 +1,232 @@
+# MDU 4.1: 启发测距函数与基础结构
+
+## 任务目标
+
+为 A* 寻路引擎搭建基础数据结构、距离测算工具类及高性能 A* 内部搜索节点定义，确立整个模块的底层数学基座。
+
+**输出标准**：纯通用几何寻路库，禁止任何业务概念；距离计算零对象分配；Node 节点支持 f 值排序。
+
+---
+
+## 1. 核心数据与算法契约（不可更改字段名与类型）
+
+### 1.1 Coordinate 数据类
+
+```kotlin
+// 网格坐标数据类
+data class Coordinate(val x: Int, val y: Int)
+```
+
+### 1.2 PathResult 数据类
+
+```kotlin
+// 寻路结果数据类
+data class PathResult(
+    val found: Boolean,           // 是否找到了可行路径
+    val path: List<Coordinate>,   // 从起点到终点的完整坐标列表（含起点和终点）
+    val totalSteps: Int,          // 移动步数 (path.size - 1)
+    val reason: String             // 寻路未通过时的原因描述
+)
+```
+
+### 1.3 PassabilityGrid 接口
+
+```kotlin
+// 性能优化地形通行快照接口
+// 外部调用方需要提前生成一个基于原生 Boolean 数组或 Map 的通行快照并注入
+// 保证 O(1) 级的通行校验开销
+interface PassabilityGrid {
+    fun isPassable(x: Int, y: Int): Boolean
+}
+```
+
+### 1.4 核心计算工具方法
+
+```kotlin
+// PathfindingEngine 中公开声明
+fun manhattanDistance(from: Coordinate, to: Coordinate): Int
+fun euclideanDistance(from: Coordinate, to: Coordinate): Double
+```
+
+---
+
+## 2. 机械式步骤指令
+
+### 2.1 创建 PathfindingEngine 骨架类
+
+```kotlin
+class PathfindingEngine {
+    // 测距方法（见 2.2）
+    // 内部 Node 类（见 2.3）
+    // Comparator（见 2.4）
+    // 禁止：A* 主循环、寻路主逻辑
+}
+```
+
+### 2.2 实现测距方法
+
+**manhattanDistance**（曼哈顿距离）：
+
+```kotlin
+fun manhattanDistance(from: Coordinate, to: Coordinate): Int {
+    return kotlin.math.abs(from.x - to.x) + kotlin.math.abs(from.y - to.y)
+}
+```
+
+公式：|from.x - to.x| + |from.y - to.y|
+
+**euclideanDistance**（欧几里得距离）：
+
+```kotlin
+fun euclideanDistance(from: Coordinate, to: Coordinate): Double {
+    val dx = (from.x - to.x).toDouble()
+    val dy = (from.y - to.y).toDouble()
+    return kotlin.math.sqrt(dx * dx + dy * dy)
+}
+```
+
+公式：√((from.x - to.x)² + (from.y - to.y)²)
+
+### 2.3 定义高性能私有辅助节点 Node
+
+```kotlin
+private class Node(
+    val x: Int,
+    val y: Int,
+    val g: Int,       // 起点到当前节点的实际代价
+    val h: Int,       // 当前节点到终点的预估启发式代价
+    val parent: Node?  // 逆向回溯 parent 指针
+) {
+    val f: Int get() = g + h
+}
+```
+
+### 2.4 定义 PriorityQueue 排序 Comparator
+
+```kotlin
+private val nodeComparator = Comparator<Node> { n1, n2 ->
+    n1.f.compareTo(n2.f)
+}
+```
+
+排序规则：f 值越小的节点优先级越高（排在前面）。
+
+---
+
+## 3. 禁止事项（硬性约束）
+
+1. **绝对禁止引入任何游戏业务概念**：本模块是一个纯粹且无状态的通用几何网格寻路算法库，严禁出现村民、仓库、商队或探索度等任何业务词汇。
+
+2. **禁止在测距时产生多余对象分配**：计算距离的数学公式必须直接执行基本运算，不创建任何临时对象，确保极限制的零 GC 压力。
+
+3. **禁止在本模块实现 A* 主循环**：本模块只负责数据结构、测距方法和 Node 定义。
+
+---
+
+## 4. 测试规范：PathfindingEngineMathTest.kt
+
+### 4.1 测试原则
+
+⚠️ 纯数学测试：仅验证测距函数和 Node 排序，不涉及寻路主逻辑。
+
+### 4.2 测试用例
+
+**T01：曼哈顿距离边界值测试**
+
+- 目的：验证曼哈顿距离在零距离、正数象限、负数跨象限场景下的精确性
+- 步骤：
+  1. 测试 Coordinate(5, 5) 到 Coordinate(5, 5)
+  2. 断言：距离 == 0（同一点）
+  3. 测试 Coordinate(0, 0) 到 Coordinate(3, 4)
+  4. 断言：距离 == 7（|0-3| + |0-4| = 3 + 4）
+  5. 测试 Coordinate(-2, -3) 到 Coordinate(2, 3)
+  6. 断言：距离 == 10（|-2-2| + |-3-3| = 4 + 6）
+- 通过标准：三场景精确
+
+**T02：欧几里得距离勾股定理校验**
+
+- 目的：验证欧氏距离勾股定理精确性
+- 步骤：
+  1. 测试 Coordinate(0, 0) 到 Coordinate(3, 4)
+  2. 断言：距离 == 5.0（精确 Double 值，勾股定理 3²+4²=25 → √25=5）
+  3. 测试 Coordinate(-1, -1) 到 Coordinate(2, 3)
+  4. 断言：距离 == 5.0（√(3²+4²) = 5.0）
+- 通过标准：勾股定理精确
+
+**T03：Node 排序优先级验证**
+
+- 目的：验证 f 值越小优先级越高
+- 步骤：
+  1. 构造 Node A（g=10, h=5 → f=15）
+  2. 构造 Node B（g=5, h=8 → f=13）
+  3. 使用 nodeComparator 比较
+- 断言：Node B 排在 Node A 之前（13 < 15）
+- 通过标准：f 值排序正确
+
+**T04：同 f 值排序稳定性测试**
+
+- 目的：验证 f 值相同时不崩溃
+- 步骤：
+  1. 构造 Node A（g=5, h=5 → f=10）
+  2. 构造 Node B（g=3, h=7 → f=10）
+  3. 使用 nodeComparator 比较
+- 断言：比较结果 == 0（同优先级）
+- 通过标准：不崩溃
+
+---
+
+## 5. 测试框架要求
+
+- 使用 kotlin.test 断言库
+- 每个测试方法独立，无执行顺序依赖
+- 禁止使用反射访问私有字段（Node 类若需测试可通过公开方法间接验证）
+
+---
+
+## 6. 输出要求
+
+1. 仅输出 Kotlin 代码文件（PathfindingEngine.kt + PathfindingEngineMathTest.kt）
+2. 包含：Coordinate、PathResult、PassabilityGrid、manhattanDistance、euclideanDistance、Node、nodeComparator
+3. 不包含：A* 主循环、寻路主逻辑
+4. 代码格式：遵循 Kotlin 官方约定
+
+---
+
+## 7. 模块边界说明
+
+**MDU 4.1（本章）**：基础结构、测距函数、Node 定义
+**MDU 4.2（后续）**：A* 核心搜索循环
+**MDU 4.3（后续）**：路径平滑与优化
+**MDU 4.4（后续）**：双向 A* 或高级变体
+**MDU 4.5（后续）**：语义冻结
+
+---
+
+## 8. 快速行为查阅
+
+**曼哈顿距离**：
+```
+manhattanDistance(Coordinate(0, 0), Coordinate(3, 4))
+  → |0 - 3| + |0 - 4|
+  → 3 + 4 = 7
+
+manhattanDistance(Coordinate(-2, -3), Coordinate(2, 3))
+  → |-2 - 2| + |-3 - 3|
+  → 4 + 6 = 10
+```
+
+**欧几里得距离**：
+```
+euclideanDistance(Coordinate(0, 0), Coordinate(3, 4))
+  → √((0-3)² + (0-4)²)
+  → √(9 + 16)
+  → √25 = 5.0
+```
+
+**Node f 值排序**：
+```
+Node(g=10, h=5) → f = 15
+Node(g=5,  h=8) → f = 13
+
+nodeComparator(A, B) → 13 vs 15 → B 排在前面（f 越小越优先）
+```
