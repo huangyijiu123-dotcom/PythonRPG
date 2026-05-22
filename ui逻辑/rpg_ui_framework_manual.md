@@ -3,6 +3,54 @@
 
 本开发说明书（以下简称“说明书”）是为 **PythonRPG** 从纯后台 Kotlin JVM 引擎演进为高质感、高性能跨平台 2D 战术游戏界面而定制的**最高规格约束文档**。本说明书旨在“框死”一切开发细节，明确划清前台 UI 渲染层与后台 17 个并发引擎的物理边界，杜绝任何 AI 幻觉、无脑生成或篡改底层稳定代码的可能。
 
+> **后台引擎模块与前端 UI 完整对照索引**
+>
+> | 后台引擎模块 (Python) | 对应前端 UI 界面 / 组件 (Compose) | 核心数据协议 / PlayerCommand |
+> |---|---|---|
+> | `engine.py` / `TickService.kt` (Tick 驱动 + 前台服务) | `ResourceHeader.kt`（顶部资源状态栏 + 晨会/暂停/播放按钮） | `MapStateSnapshot.tickId`, `timeOfDay`, `dayCount` |
+> | `territory.py` (领地单例容器，全局状态唯一入口) | 全部 Tab 共享 `GameViewModel` | `MapStateSnapshot` 全部只读字段 |
+> | `map_generator.py` (地图生成) + `daynight.py` (昼夜) | `MapScreen.kt` + `MapCanvas.kt`（地图 Tab，第1~8级渲染管线） | `TileSnapshot`, `ExploreStatus`, 迷雾/滤镜渲染 |
+> | `villager.py` (村民实体) | `EntitySheet.kt`（村民 BottomSheet）+ `MapCanvas.kt` 翡翠绿粒子渲染 | `EntityGlowPoint(type="VILLAGER")`, `PlayerCommand.AssignJob` |
+> | `adventurer.py` (冒险者实体) | `EntitySheet.kt`（冒险者 BottomSheet）+ `BattlePanel.kt`（异步战斗） | `EntityGlowPoint(type="ADVENTURER")`, `PlayerCommand.DispatchAdventurer` |
+> | `caravan.py` (商队实体) | `EntitySheet.kt`（商队 BottomSheet） | `EntityGlowPoint(type="CARAVAN")`, `PlayerCommand.DispatchCaravan` |
+> | `monster.py` (怪物实体) | `MapCanvas.kt`（深渊紫粒子渲染） | `EntityGlowPoint(type="MONSTER")`, 自动/手动战斗 |
+> | `building.py` (建筑) | `TerritoryScreen.kt`（建筑卡片列表）+ `MapCanvas.kt` 像素图标渲染 | `TileSnapshot.buildingSymbol`, `PlayerCommand.BuildBuilding`, `PlayerCommand.UpgradeBuilding` |
+> | `economy.py` (资源结算) | `ResourceHeader.kt`（金木石铁药实时数字）+ `ReportScreen.kt`（折线趋势图） | `MapStateSnapshot` 资源字段 (gold/wood/stone/iron/herbs/food) |
+> | `warehouse.py` (仓库物流) | `TerritoryScreen.kt`（仓库容量进度条）+ `EntitySheet.kt`（仓库详情面板） | `MapStateSnapshot.warehouseSnapshots` |
+> | `trade.py` / `market_dynamics.py` (贸易与动态物价) | `ReportScreen.kt`（城邦市场总览表格）+ `EntitySheet.kt`（城邦物价表 / 价格历史） | `MapStateSnapshot.marketData`, `PlayerCommand.DispatchCaravan` |
+> | `combat.py` (异步战斗系统) | `BattlePanel.kt`（半屏战斗答题面板，占屏幕 45%） | `ActiveBattleSnapshot`, `PlayerCommand.AnswerQuestion` |
+> | `forge.py` (铁匠铺 / 装备强化 / 拆解) | `TerritoryScreen.kt`（铁匠铺卡片）+ `EntitySheet.kt`（装备面板 / 武器防具槽位） | `PlayerCommand.ForgeItem`, `PlayerCommand.UpgradeEquipment`, `PlayerCommand.RepairEquipment`, `PlayerCommand.DismantleEquipment` |
+> | `workshop.py` (工房 / 工具制造队列) | `TechScreen.kt`（工房子标签页）+ 生产进度条 | `PlayerCommand.QueueProduction`, `MapStateSnapshot.workshopQueue` |
+> | `policy.py` (政策法令) | `TerritoryScreen.kt`（法令面板 / 激活/停用开关） | `MapStateSnapshot.activePolicyNames`, `PlayerCommand.EnactPolicy` |
+> | `technology.py` (科技树 + 科学院考核) | `TechScreen.kt`（科技星图卡片视图）+ `AcademyExamDialog.kt`（考核沙盒全屏弹窗） | `MapStateSnapshot.techProgress`, `PlayerCommand.StartResearch`, `PlayerCommand.SubmitExamAnswer` |
+> | `weather.py` (天气系统) | `ResourceHeader.kt`（天气图标）+ `MapCanvas.kt` 第8级滤镜叠加 | `MapStateSnapshot.weatherModifiers` (含 drought/storm/blizzard 子字段) |
+> | `event_engine.py` (突发事件：火灾/洪水/瘟疫/Boss骚乱/寒流/坍塌) | `LogConsoleScreen.kt`（灾难预警消息，橙色高亮）+ `MapCanvas.kt` 地图特效标记 | `MapStateSnapshot.activeEvents`, `PlayerCommand.DispatchEmergency` |
+> | `relic_discovery.py` (遗迹代码修复) | `RelicCodeDialog.kt`（泛黄纸张主题修复面板，半屏 BottomSheet） | `MapStateSnapshot.relicCodeState`, `PlayerCommand.OpenRelicCode`, `PlayerCommand.SubmitRelicFix` |
+> | `treasure_hunt.py` (藏宝图寻宝) | `EntitySheet.kt`（藏宝图详情弹窗 / 寻宝进度） | `MapStateSnapshot.treasureMaps`, `PlayerCommand.StartTreasureHunt` |
+> | `pathfinding.py` (寻路算法) | `MapCanvas.kt`（青蓝色虚线移动路径预览 + 目标终点闪烁箭头） | 无独立命令，嵌入 `PlayerCommand.DispatchXxx` |
+> | `function_lib.py` (函数库持久化) | `CodeEditor.kt`（函数库标签页）+ `StrategyManager.kt`（策略管理面板） | `PlayerCommand.SaveFunction`, `PlayerCommand.LoadFunction` |
+> | `debug_translator.py` (村长翻译官) | `LogConsoleScreen.kt`（可折叠错误卡片）+ `Dialogues.kt`（非模态村长气泡，3秒自动消失） | 无独立数据合约，通过日志流注入翻译卡片 |
+> | `sandbox.py` (沙箱执行器) | `CodeEditor.kt`（积木/填空/手打三模式编辑器） | `PlayerCommand.ExecuteScript` |
+> | `simulation.py` (仿真预测) | `ReportScreen.kt`（仿真预测卡片，钻石学位解锁） | `PlayerCommand.RunSimulation` |
+> | `guild.py` (冒险者公会 / 酒馆招募) | `TerritoryScreen.kt`（酒馆招募面板）+ 冒险者列表 | `PlayerCommand.RecruitAdventurer` |
+> | `labor.py` (劳动系统 / 搬运工分配) | `MapCanvas.kt`（实体移动动画 + 轨迹指示）+ `EntitySheet.kt`（搬运工状态） | `PlayerCommand.AssignJob("搬运工")` |
+>
+> **术语标准化对照（游戏说明书 ↔ UI 说明书 → 统一术语）**：
+>
+> | 游戏说明书术语 | UI 说明书旧术语 | 统一采用 | 备注 |
+> |---|---|---|---|
+> | “代码编辑器” | “魔导书” | **代码编辑器** | 功能本质是 Python IDE，改直白命名 |
+> | “教学学位”（青铜/白银/黄金/钻石） | 未提及 | **教学学位** | 四个阶段对应 API 逐级解锁 |
+> | “晨会时间” | 未提及 | **晨会时间** | 手动模式清晨弹性时间（60秒），状态栏变金色 |
+> | “村长翻译官” | 未明确 | **村长翻译官** | Python 错误拦截 + 村长口吻翻译 + 修正建议卡片 |
+> | “资源状态看板” (HP/MP/LVL/EXP) | Resource Counters | **资源状态看板** | 包含 HP（当前/最大）、MP（玩家答题点数）、LVL（学位阶段）、EXP（经验进度%） |
+> | “城邦市场” | 未提及 | **城邦市场总览** | 列在报表 Tab 中，显示所有已知城邦物价与涨跌箭头 |
+> | “异步战斗面板” | BattlePanel | **异步战斗面板** | 45% 屏占比的底部面板，含倒计时圆环、题目、选项按钮、MP技能按钮 |
+> | “遗迹代码修复面板” | RelicCodeDialog | **遗迹代码修复面板** | 泛黄纸张主题，衬线字体，Bug行高亮可编辑 |
+> | “科技考核沙盒” | AcademyExamDialog | **科技考核沙盒** | 全屏弹窗，含题目、代码编辑区、运行/提示按钮 |
+> | “策略管理面板” | StrategyManager | **策略管理面板** | 管理玩家保存的 Tick 策略脚本，含触发条件配置 |
+
+
 > [!IMPORTANT]
 > **绝对开发原则（签字生效约束）**
 > 1. **严禁越线修改**：在得到你对本说明书的显式“同意”审批之前，本 AI 绝对不对 `rpgyouxi` 项目中的任何代码进行实际开发、脚手架升级或包目录创建。
@@ -204,22 +252,65 @@ import com.example.pythonrpg.shared.*
 data class MapStateSnapshot(
     val tickId: Long,
     val timeOfDay: TimePeriod,
+    val dayCount: Int,
     val weatherModifiers: WeatherModifiers,
     val policyModifiers: PolicyModifiers,
+    // 核心资源（王城可用库存 + 全局金币）
     val gold: Int,
     val wood: Int,
     val stone: Int,
     val iron: Int,
     val herbs: Int,
+    val food: Int,
+    // 玩家答题点数（当前可用 / 最大上限，用于 BattlePanel MP 扣减逻辑）
     val activeAdventurerMp: Int,
+    val maxAdventurerMp: Int,
+    // 教学学位阶段（BRONZE / SILVER / GOLD / DIAMOND）
+    val currentDegree: String,
     
-    // 只读扁平列表，UI 直接进行高效渲染，无须跨模块查找
+    // === 只读扁平列表 ===
     val tiles: List<TileSnapshot>,
     val entities: List<EntityGlowPoint>,
     val systemLogs: List<String>,
     
-    // 活跃战斗会话（若为 null 表示当前未发生答题死斗）
-    val activeBattleSession: ActiveBattleSnapshot?
+    // === 铁匠铺状态 ===
+    val forgeQueue: List<ForgeTaskSnapshot>,
+    
+    // === 工房生产状态 ===
+    val workshopQueue: List<WorkshopTaskSnapshot>,
+    
+    // === 仓库状态快照 ===
+    val warehouseSnapshots: List<WarehouseSnapshot>,
+    
+    // === 城邦市场数据 ===
+    val marketData: List<CityStateMarketSnapshot>,
+    
+    // === 科技进度 ===
+    val techProgress: List<TechNodeSnapshot>,
+    
+    // === 活跃法令 ===
+    val activePolicyNames: List<String>,
+    
+    // === 活跃突发事件 ===
+    val activeEvents: List<ActiveEventSnapshot>,
+    
+    // === 遗迹代码状态 ===
+    val relicCodeState: RelicCodeSnapshot?,
+    
+    // === 藏宝图列表 ===
+    val treasureMaps: List<TreasureMapSnapshot>,
+    
+    // === 活跃战斗会话（多个冒险者可能同时在战斗） ===
+    val activeBattleSessions: List<ActiveBattleSnapshot>,
+    
+    // === 冒险者队伍 ===
+    val adventurerParty: List<AdventurerSnapshot>,
+    
+    // === 商队编队 ===
+    val caravanFleet: List<CaravanSnapshot>,
+    
+    // === 可用策略列表 ===
+    val savedStrategies: List<StrategyMetaSnapshot>
 )
 
 data class TileSnapshot(
@@ -264,18 +355,261 @@ data class ActiveBattleSnapshot(
 
 ```kotlin
 // 前台按钮完全映射的 PlayerCommand 类目清单 (严密对齐 SharedModels.kt)
+// 覆盖全部后端引擎模块：建筑/村民/冒险者/商队/战斗/铁匠铺/工房/科技/政策/遗迹/寻宝/策略
 val cmd = when(actionType) {
+    // === 建筑操作 ===
     "BUILD" -> PlayerCommand.BuildBuilding(x = selectX, y = selectY, buildingType = "HOUSE")
     "UPGRADE" -> PlayerCommand.UpgradeBuilding(x = selectX, y = selectY)
-    "RESEARCH" -> PlayerCommand.StartResearch(techId = "METALLURGY")
-    "POLICY" -> PlayerCommand.EnactPolicy(policyType = "MERCANTILISM", isActive = true)
+    "DEMOLISH" -> PlayerCommand.DemolishBuilding(x = selectX, y = selectY)
+    
+    // === 村民操作 ===
     "ASSIGN_JOB" -> PlayerCommand.AssignJob(villagerId = 101L, job = "LUMBERJACK", targetX = 5, targetY = 12)
+    "RECALL_VILLAGER" -> PlayerCommand.RecallVillager(villagerId = 101L)
+    "EQUIP_TOOL" -> PlayerCommand.EquipTool(villagerId = 101L, toolName = "铁斧")
+    
+    // === 冒险者操作 ===
     "DISPATCH_ADVENTURER" -> PlayerCommand.DispatchAdventurer(adventurerId = 201L, targetX = 15, targetY = 15)
+    "RECALL_ADVENTURER" -> PlayerCommand.RecallAdventurer(adventurerId = 201L)
+    "SET_ESCORT" -> PlayerCommand.SetEscort(adventurerId = 201L, caravanId = 301L)
+    "SET_COMBAT_STRATEGY" -> PlayerCommand.SetCombatStrategy(adventurerId = 201L, strategyName = "bossFleeStrategy")
+    "RECRUIT_ADVENTURER" -> PlayerCommand.RecruitAdventurer()
+    
+    // === 商队操作 ===
+    "DISPATCH_CARAVAN" -> PlayerCommand.DispatchCaravan(caravanId = 301L, destinationCity = "黑铁堡")
+    "RECALL_CARAVAN" -> PlayerCommand.RecallCaravan(caravanId = 301L)
+    "SET_CARAVAN_MODE" -> PlayerCommand.SetCaravanMode(caravanId = 301L, mode = "内部运输")
+    "CARAVAN_LOAD_CARGO" -> PlayerCommand.CaravanLoadCargo(caravanId = 301L, cargo = mapOf("木材" to 50))
+    "CARAVAN_SET_PICKUP" -> PlayerCommand.CaravanSetPickup(caravanId = 301L, warehouseX = 3, warehouseY = 5)
+    "CARAVAN_SET_DROPOFF" -> PlayerCommand.CaravanSetDropoff(caravanId = 301L, warehouseX = 0, warehouseY = 0)
+    
+    // === 战斗操作 ===
+    "ANSWER_QUESTION" -> PlayerCommand.AnswerQuestion(sessionId = 401L, answerIndex = 1)
+    "USE_BATTLE_SKILL" -> PlayerCommand.UseBattleSkill(sessionId = 401L, skillName = "延时", mpCost = 5)
+    "AUTO_BATTLE" -> PlayerCommand.AutoBattle(sessionId = 401L)
+    "FLEE_BATTLE" -> PlayerCommand.FleeBattle(sessionId = 401L)
+    
+    // === 铁匠铺操作 ===
+    "FORGE_ITEM" -> PlayerCommand.ForgeItem(itemName = "铁剑")
+    "UPGRADE_EQUIPMENT" -> PlayerCommand.UpgradeEquipment(equipmentId = 501L)
+    "REPAIR_EQUIPMENT" -> PlayerCommand.RepairEquipment(equipmentId = 501L)
+    "REPAIR_ALL" -> PlayerCommand.RepairAllEquipment(adventurerId = 201L)
+    "DISMANTLE_EQUIPMENT" -> PlayerCommand.DismantleEquipment(equipmentId = 501L)
+    
+    // === 工房操作 ===
+    "QUEUE_PRODUCTION" -> PlayerCommand.QueueProduction(toolName = "铁斧", quantity = 5)
+    "CANCEL_PRODUCTION" -> PlayerCommand.CancelProduction(taskId = "task_001")
+    
+    // === 科技与科学院操作 ===
+    "START_RESEARCH" -> PlayerCommand.StartResearch(techId = "METALLURGY")
+    "SUBMIT_EXAM_ANSWER" -> PlayerCommand.SubmitExamAnswer(techId = "METALLURGY", answer = "print('hello')")
+    "CANCEL_RESEARCH" -> PlayerCommand.CancelResearch(techId = "METALLURGY")
+    
+    // === 政策法令操作 ===
+    "ENACT_POLICY" -> PlayerCommand.EnactPolicy(policyType = "MERCANTILISM", isActive = true)
+    
+    // === 突发事件操作 ===
+    "DISPATCH_EMERGENCY" -> PlayerCommand.DispatchEmergency(eventId = 601L, responderId = 101L)
+    
+    // === 遗迹代码操作 ===
+    "OPEN_RELIC_CODE" -> PlayerCommand.OpenRelicCode(relicId = "relic_logistics_001")
+    "SUBMIT_RELIC_FIX" -> PlayerCommand.SubmitRelicFix(relicId = "relic_logistics_001", fixedCode = "def fix(): ...")
+    
+    // === 藏宝图操作 ===
+    "START_TREASURE_HUNT" -> PlayerCommand.StartTreasureHunt(mapId = "treasure_silver_001")
+    
+    // === 策略与函数库操作 ===
+    "EXECUTE_SCRIPT" -> PlayerCommand.ExecuteScript(codeString = "for v in territory.get_idle_villagers(): ...")
+    "SAVE_FUNCTION" -> PlayerCommand.SaveFunction(name = "全员工具维护", code = "def ...")
+    "LOAD_FUNCTION" -> PlayerCommand.LoadFunction(name = "全员工具维护")
+    "DELETE_FUNCTION" -> PlayerCommand.DeleteFunction(name = "全员工具维护")
+    "SAVE_STRATEGY" -> PlayerCommand.SaveStrategy(name = "综合调度 v1", triggerCondition = "每 Tick", code = "def ...")
+    
+    // === 仓库操作 ===
+    "EXPAND_WAREHOUSE" -> PlayerCommand.ExpandWarehouse(warehouseX = 0, warehouseY = 0)
+    "UPGRADE_TO_DISTRIBUTION" -> PlayerCommand.UpgradeToDistributionCenter(warehouseX = 3, warehouseY = 5)
+    
+    // === 仿真预测 ===
+    "RUN_SIMULATION" -> PlayerCommand.RunSimulation(ticksToSimulate = 30)
+    
     else -> null
 }
 ```
 
 ---
+
+
+---
+
+## 五-A、 补充 UI 组件规格：引擎模块对应交互面板
+
+以下补充第 2~4 节未覆盖的后台引擎模块对应的完整前端 UI 面板规格。
+
+### 5A.1 铁匠铺面板 (ForgePanel)
+
+铁匠铺是装备锻造、强化、修复与拆解的唯一入口。位于领地 Tab 的卡片列表中，点击铁匠铺卡片弹出全屏管理面板：
+
+```
+┌─────────────────────────────────────┐
+│  ⚒️ 铁匠铺 Lv.3        [ ✕ 关闭 ]   │
+│  ───────────────────────────────── │
+│  [锻造新装备]                        │
+│  ┌──────┬──────┬──────┬──────┐     │
+│  │ 铁剑 │ 铁斧 │ 铁镐 │ 铁甲 │     │
+│  │ 🪵20 │ 🪵15 │ 🪵10 │ 🪨30 │     │
+│  │ 🪨10 │ 🪨20 │ 🪨15 │ 🪵10 │     │
+│  └──────┴──────┴──────┴──────┘     │
+│  ───────────────────────────────── │
+│  冒险者装备管理                      │
+│  ┌ 赵六 (精英 Lv.5) ──────────────┐ │
+│  │ 武器: 铁剑 Lv.3 ██████░░ 78/100│ │
+│  │ 防具: 皮甲 Lv.2 ████████░ 92/100││
+│  │ [🔧修复] [⬆强化] [💥拆解] [🔧一键修复]││
+│  └────────────────────────────────┘ │
+└─────────────────────────────────────┘
+```
+
+- **锻造网格**：图标 + 名称 + 所需材料，材料不足项红色高亮且灰显按钮。
+- **强化**：消耗金币 + 铁矿，成功则装备等级 +1，失败则等级 -1（不掉落至 0 以下）。
+- **修复**：消耗铁矿恢复单个装备耐久度。
+- **一键修复**：消耗铁矿恢复该冒险者全身装备耐久度——对应 `forge.repair_all(adventurer)`。
+- **拆解**：销毁装备，返还部分材料（约 50% 建造消耗）——对应 `forge.dismantle(equipment)`。
+
+### 5A.2 工房面板 (WorkshopPanel)
+
+位于科技 Tab 的第二个子标签页，管理工具制造队列：
+
+```
+┌─────────────────────────────────────┐
+│  🏭 工房 Lv.2                      │
+│  ───────────────────────────────── │
+│  当前队列 (2/3):                    │
+│  ┌ 铁斧 ×5  ████████░░ 剩余 8 Tick │
+│  │ [取消]                          │
+│  └─────────────────────────────────┘ │
+│  ┌ 石镐 ×3  ██░░░░░░░░ 剩余 15 Tick │
+│  │ [取消]                          │
+│  └─────────────────────────────────┘ │
+│  ───────────────────────────────── │
+│  [+ 制造新工具]                     │
+│  库存预警: 铁斧(2) ⚠️ 石镐(1) ⚠️    │
+└─────────────────────────────────────┘
+```
+
+- 每个队列项显示图标、数量、进度条、剩余 Tick。
+- 取消返回 50% 材料。
+- "制造新工具"弹出配方选择对话框——对应 `workshop.queue_production(tool_name, quantity)`。
+
+### 5A.3 酒馆 / 冒险者招募面板 (GuildPanel)
+
+位于领地 Tab 中，点击酒馆卡片打开：
+
+```
+┌─────────────────────────────────────┐
+│  🍺 酒馆 Lv.2                      │
+│  ───────────────────────────────── │
+│  可招募冒险者:                      │
+│  ┌ 王五  精英 Lv.3  💰150         │
+│  │ HP:120 ATK:45 DEF:30           │
+│  │ 技能: 重击                      │
+│  │ [招募]                         │
+│  ├─────────────────────────────────┤
+│  │ 李四  普通 Lv.1  💰50          │
+│  │ HP:80 ATK:25 DEF:15            │
+│  │ [招募]                         │
+│  └─────────────────────────────────┘ │
+│  刷新倒计时: 12 Tick               │
+└─────────────────────────────────────┘
+```
+
+- 冒险者品质色边框：白(普通) / 蓝(精英) / 紫(史诗)。
+- 金币不足时按钮变灰。
+- 酒馆每 24 Tick 自动刷新可选冒险者池。
+
+### 5A.4 政策法令面板 (PolicyPanel)
+
+位于领地 Tab 中，以开关列表形式展示：
+
+```
+┌─────────────────────────────────────┐
+│  📜 政策法令                       │
+│  ───────────────────────────────── │
+│  ┌ 口粮配给制 ──────── [激活🔵] ─┐ │
+│  │ 食物消耗 -30%，村民体力恢复 -20% │ │
+│  └────────────────────────────────┘ │
+│  ┌ 全民皆兵 ──────── [停用⚪] ──┐ │
+│  │ 所有村民攻击力 +50%，产量 -30%    │ │
+│  └────────────────────────────────┘ │
+│  ┌ 狂热采集 ──────── [停用⚪] ──┐ │
+│  │ 采集速度 +40%，工具耐久消耗 ×2    │ │
+│  └────────────────────────────────┘ │
+└─────────────────────────────────────┘
+```
+
+- 激活中：蓝色开关 + 绿色背景卡片。
+- 停用中：灰色开关 + 白色背景卡片。
+- 切换即触发 `PlayerCommand.EnactPolicy`，后台即时生效。
+
+### 5A.5 天气与事件监控
+
+天气图标集成于 `ResourceHeader.kt` 左侧：
+- ☀️ 晴天 / 🌧️ 暴雨 / ❄️ 寒潮 / 🔥 干旱 / ⛈️ 雷暴
+- 点击图标弹出迷你浮窗：天气名 + 对各项效率的加成/减成系数
+
+突发事件在 `LogConsoleScreen.kt` 中以橙色高亮消息出现，同时 `MapCanvas.kt` 在地图对应坐标渲染事件图标：
+- 🔥 火灾：红色闪烁标记
+- 🌊 洪水：蓝色水纹动画
+- ☠️ 瘟疫：绿色骷髅图标
+- ⚫ Boss骚乱：紫色警报圈
+
+### 5A.6 背包面板 (InventoryPanel)
+
+全屏 Dialog，顶部三个标签页：📦资源 | ⚔️装备 | 🧪药水
+
+```
+┌─────────────────────────────────────┐
+│  📦背包          [📦资源|⚔️装备|🧪药水] │
+│  ───────────────────────────────── │
+│  ┌───┬───┬───┬───┐                │
+│  │🪵  │🪨  │⛏️  │🍇  │                │
+│  │木材│石材│铁矿│食物│                │
+│  │1200│840 │300 │450 │                │
+│  └───┴───┴───┴───┘                │
+│  ┌───┬───┬───┬───┐                │
+│  │🌿  │💊  │⚗️  │🔮  │                │
+│  │草药│药水│药剂│卷轴│                │
+│  │ 80 │ 15 │  5 │  2 │                │
+│  └───┴───┴───┴───┘                │
+└─────────────────────────────────────┘
+```
+
+装备标签页以槽位形式展示（武器/防具/饰品），药水标签页显示可使用/可装备的消耗品。
+
+### 5A.7 设置面板 (SettingsScreen)
+
+从主界面右上角齿轮图标或底部导航的 ⚙️ 按钮进入。分四个子分类：
+
+| 分类 | 设置项 |
+|------|--------|
+| 游戏 | Tick速度(3s/5s/10s/15s)、晨会时间开关、自动暂停开关、地图网格线开关、实体图标大小 |
+| 通知 | 总开关、黄昏提醒、灾难警报、商队归来、资源预警、勿扰时段 |
+| 显示 | 字体大小(小/中/大)、深色模式(跟随系统/始终浅色/始终深色/游戏夜晚自动)、色盲模式、高对比度文本 |
+| 存档 | 导出存档(JSON)、导入存档、云存档(预留)、重置游戏(二次确认) |
+
+### 5A.8 晨会时间特殊 UI
+
+当进入晨会时间（手动模式清晨，`timeOfDay == TimePeriod.MORNING && isMorningMeeting`）：
+- 顶部 `ResourceHeader` 整条变为**金黄色**背景
+- 左侧文字变为"☀️ 晨会时间"
+- 右侧出现脉冲动画按钮"开工"
+- 点击"开工"向后台提交 `PlayerCommand.EndMorningMeeting`，恢复正常 Tick
+- 地图上未分配村民以高亮边框闪烁提示
+
+### 5A.9 编程技能板 (SkillBoard)
+
+位于报表 Tab 中，以"已点亮/待解锁"图标网格展示玩家已掌握的 Python 概念：
+- ✅ for循环 / ✅ while循环 / ✅ if判断 / ✅ 函数定义 / 🔒 列表操作 / 🔒 字典操作 / 🔒 排序算法 / 🔒 文件读写
+- 判断标准：手打模式下成功运行过包含该概念的脚本即点亮。
+
 
 ## 六、 阶段性开发步骤与严苛验证计划
 
