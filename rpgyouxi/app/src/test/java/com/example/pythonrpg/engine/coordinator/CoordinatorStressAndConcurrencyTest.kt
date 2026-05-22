@@ -50,7 +50,7 @@ class CoordinatorStressAndConcurrencyTest {
 
         // 设定多重崩坏条件
         every { buildingEngine.processTick() } throws NullPointerException("NPE in building")
-        every { marketEngine.processTick() } throws IllegalStateException("ISE in market")
+        every { marketEngine.processTick(any()) } throws IllegalStateException("ISE in market")
 
         coordinator.startLoop()
         runCurrent()
@@ -73,7 +73,7 @@ class CoordinatorStressAndConcurrencyTest {
         clearMocks(weatherEngine, policyEngine, buildingEngine, marketEngine)
         // 恢复正常
         every { buildingEngine.processTick() } returns Unit
-        every { marketEngine.processTick() } returns Unit
+        every { marketEngine.processTick(any()) } returns Unit
 
         // 触发第二个 tick 验证大循环依然正常运转，新一轮拓扑更新从最顶部开启
         testFlow.emit(TickEvent(2L, System.currentTimeMillis(), TimePeriod.DAYTIME))
@@ -82,7 +82,7 @@ class CoordinatorStressAndConcurrencyTest {
         verify(exactly = 1) { weatherEngine.processTick() }
         verify(exactly = 1) { policyEngine.processTick() }
         verify(exactly = 1) { buildingEngine.processTick() }
-        verify(exactly = 1) { marketEngine.processTick() }
+        verify(exactly = 1) { marketEngine.processTick(any()) }
 
         coordinator.stopLoop()
     }

@@ -67,10 +67,10 @@ class CoordinatorStrictPipelineTest {
             buildingEngine.processTick()
             workshopEngine.processTick()
             forgeEngine.processTick()
-            eventEngine.processTick()
-            marketEngine.processTick()
+            eventEngine.processTick(1L)
+            marketEngine.processTick(1L)
             policyEngine.getModifiers()
-            actionProcessor.processTick(any(), modifiers, com.example.pythonrpg.shared.WeatherModifiers())
+            actionProcessor.processTick(any(), any(), any())
             entityState.emitStateDiff()
             mapData.emitDirtyTiles()
         }

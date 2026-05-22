@@ -52,7 +52,7 @@ class BuildingLifecycleAndDestructionTest {
         assertTrue(engine.startUpgrade(id))
         assertEquals(BuildingState.UPGRADING, snap.state)
         
-        val upgradeMax = snap.maxConstructionProgress * 2 // level 1 + 1 = 2 * base
+        val upgradeMax = snap.maxConstructionProgress
         for (i in 0 until upgradeMax) {
             engine.processTick()
         }

@@ -60,8 +60,8 @@ class GameLoopCoordinator(
                     forgeEngine.processTick()
 
                     // 层级 3：动态事件与经济流转
-                    eventEngine.processTick()
-                    marketEngine.processTick()
+                    eventEngine.processTick(tickEvent.tickId)
+                    marketEngine.processTick(tickEvent.tickId)
 
                     // 层级 4：行为决策与结算
                     val curPolicyModifiers = policyEngine.getModifiers()

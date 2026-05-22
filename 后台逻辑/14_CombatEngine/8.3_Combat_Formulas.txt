@@ -28,13 +28,13 @@ fun submitAnswer(sessionId: Long, isCorrect: Boolean): AnswerResult
 ### 机械式步骤指令：
 1. **执行答对分支处理 (`isCorrect == true`)**：
    - 步骤 A：连击数滚雪球：`session.comboCount += 1`。连续超时次数归零：`session.consecutiveTimeoutCount = 0`。
-   - 步骤 B：**滑窗暴击率核算**：
-     - 若 $\text{comboCount} \le 2$：暴击几率 $C_{crit} = 0.0f$。
-     - 若 $\text{comboCount}$ 在 $3 \sim 4$ 之间：暴击几率 $C_{crit} = 0.3f$。
-     - 若 $\text{comboCount} \ge 5$：暴击几率 $C_{crit} = 0.7f$。
+   - 步骤 B：**确定性连击伤害倍率计算**：
+     - 若 `session.comboCount < 3`：连击倍率 $M_{combo} = 1.0f$。
+     - 若 `session.comboCount` 为 3 或 4：连击倍率 $M_{combo} = 1.5f$。
+     - 若 `session.comboCount >= 5`：连击倍率 $M_{combo} = 2.0f$。
    - 步骤 C：基础伤害核算（从 provider 获取实时全装攻击力 $Att_{adv}$）：
      $$D_{base} = \max(1, Att_{adv} - \text{monster.defense})$$
-   - 步骤 D：暴击摇点：随机摇号 `Random.nextFloat() < C_crit`。若暴击：最终伤害 $D_{final} = (D_{base} \times 2.0f \times \text{session.damageMultiplier}).toInt()$，`isCritical = true`；若未暴击，最终伤害 $D_{final} = (D_{base} \times 1.0f \times \text{session.damageMultiplier}).toInt()$，`isCritical = false`。
+   - 步骤 D：最终伤害核算：最终伤害 $D_{final} = (D_{base} \times M_{combo} \times \text{session.damageMultiplier}).toInt()$。若 $M_{combo} \ge 2.0f$（连击数达到 5，触发“代码暴击”），设置 `isCritical = true`，否则 `isCritical = false`。
    - 步骤 E：扣减怪物生命值：`session.monsterCurrentHp = (session.monsterCurrentHp - D_{final}).coerceAtLeast(0)`。
 2. **执行答错分支处理 (`isCorrect == false`)**：
    - 步骤 A：连击数熔断归零：`session.comboCount = 0`。连续超时次数归零：`session.consecutiveTimeoutCount = 0`。
@@ -53,13 +53,14 @@ fun submitAnswer(sessionId: Long, isCorrect: Boolean): AnswerResult
 编写单元测试 `CombatManualAnswerFormulaTest.kt`。
 
 ### 机械式测试用例：
-1. **答对伤害保底与暴击倍率拦截测试**：
+1. **答对伤害保底与连击倍率拦截测试**：
    - 注册小怪，防御极高为 9999。玩家全装攻击力 10。
-   - 答对第 1 题（连击 = 1，暴击率 0%）。
+   - 答对第 1 题（连击 = 1，连击倍率 1.0x）。
    - **断言 1**：伤害触发保底，精准为 `1`。
-   - 设法制造连击达到 5。再次答对一题。
-   - **断言 2**：连击达到 5 后的暴击率返回 `0.7f`。
-   - 多次摇点测试，若触发暴击（`isCritical == true`），断言伤害精准等于 $1 \times 2 = 2$ 保底。
+   - 设法制造连击达到 3。再次答对一题（连击 = 3，连击倍率 1.5x）。
+   - **断言 2**：最终伤害核算（基础保底 1 乘以 1.5 连击倍率并转为整数），最终伤害精准为 `1`。
+   - 设法制造连击达到 5。再次答对一题（连击 = 5，连击倍率 2.0x，“代码暴击”）。
+   - **断言 3**：最终伤害核算（基础保底 1 乘以 2.0 连击倍率），最终伤害精准等于 $1 \times 2 = 2$。
 2. **答错反击保底与连击熔断重置测试**：
    - 玩家防御力 9999，怪物力量 10。当前连击数为 4。
    - 调用 `submitAnswer(sessionId, isCorrect = false)` 答错。

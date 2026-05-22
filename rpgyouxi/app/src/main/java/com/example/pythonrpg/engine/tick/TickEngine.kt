@@ -36,12 +36,21 @@ class TickEngine(private val scope: CoroutineScope) {
     )
     val tickFlow: SharedFlow<TickEvent> = _tickFlow.asSharedFlow()
 
+    private val _timePeriodChangeFlow = MutableSharedFlow<TimePeriod>(
+        replay = 1,
+        extraBufferCapacity = 16,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val timePeriodChangeFlow: SharedFlow<TimePeriod> = _timePeriodChangeFlow.asSharedFlow()
+
     private val _realTickFlow = MutableSharedFlow<Long>(
         replay = 0,
         extraBufferCapacity = 1,
         onBufferOverflow = BufferOverflow.DROP_OLDEST
     )
     val realTickFlow: SharedFlow<Long> = _realTickFlow.asSharedFlow()
+
+    private var lastPeriod: TimePeriod? = null
 
     /**
      * 启动心跳循环
@@ -54,6 +63,7 @@ class TickEngine(private val scope: CoroutineScope) {
             }
 
             currentTickId.set(initialTick)
+            lastPeriod = getPeriod(initialTick)
             accumulator = 0L
             isEnginePaused.set(false)
             isLogicPaused.set(false)
@@ -70,12 +80,18 @@ class TickEngine(private val scope: CoroutineScope) {
                             while (accumulator >= currentInterval) {
                                 if (!isLogicPaused.get()) {
                                     val nextTickId = currentTickId.incrementAndGet()
+                                    val currentPeriod = getPeriod(nextTickId)
                                     val event = TickEvent(
                                         tickId = nextTickId,
                                         timestamp = System.currentTimeMillis(),
-                                        timeOfDay = getPeriod(nextTickId)
+                                        timeOfDay = currentPeriod
                                     )
                                     _tickFlow.tryEmit(event)
+                                    
+                                    if (currentPeriod != lastPeriod) {
+                                        lastPeriod = currentPeriod
+                                        _timePeriodChangeFlow.tryEmit(currentPeriod)
+                                    }
                                 }
                                 accumulator -= currentInterval
                             }

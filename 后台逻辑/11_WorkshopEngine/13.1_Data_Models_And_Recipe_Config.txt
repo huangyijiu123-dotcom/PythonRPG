@@ -55,12 +55,12 @@ data class WorkshopRecipe(
 
 ### 机械式步骤指令：
 1. **硬编码静态配方字典配置**（在 `WorkshopEngine` 内部声明 `val recipes: Map<ToolType, WorkshopRecipe>`）：
-   - `STONE_AXE` (石斧)：木材 5，耗时 3 Tick，无科技限制。
-   - `IRON_AXE` (铁斧)：木材 5，铁矿 3，耗时 5 Tick，科技要求 `"IRON_FORGING"`。
-   - `STONE_PICKAXE` (石镐)：木材 5，耗时 3 Tick，无科技限制。
-   - `IRON_PICKAXE` (铁镐)：木材 5，铁矿 3，耗时 5 Tick，科技要求 `"IRON_FORGING"`。
-   - `BACKPACK` (背包)：纤维 10，耗时 2 Tick，无科技限制。
-   - `WHEELBARROW` (小推车)：木材 20，耗时 4 Tick，科技要求 `"BASIC_LOGISTICS"`。
+    - `STONE_AXE` (石斧)：木材 5，耗时 3 Tick，科技要求 `"石制工具"`。
+    - `IRON_AXE` (铁斧)：木材 5，铁矿 3，耗时 5 Tick，科技要求 `"铁器锻造"`。
+    - `STONE_PICKAXE` (石镐)：木材 5，耗时 3 Tick，科技要求 `"石制工具"`。
+    - `IRON_PICKAXE` (铁镐)：木材 5，铁矿 3，耗时 5 Tick，科技要求 `"铁器锻造"`。
+    - `BACKPACK` (背包)：纤维 10，耗时 2 Tick，科技要求 `"背包编织"`。
+    - `WHEELBARROW` (小推车)：木材 20，耗时 4 Tick，科技要求 `"小推车"`。
 2. **构建高安全的并发状态字典**：
    - 实例化 `class WorkshopEngine`。
    - 内部维护并发安全的工房字典及全局自增任务 ID 发生器：
@@ -79,9 +79,9 @@ data class WorkshopRecipe(
 ### 机械式测试用例：
 1. **石斧与铁镐静态配方造价精度校验**：
    - 提取 STONE_AXE (石斧) 配方。
-   - **断言 1**：木材消耗精准等于 `5`，不需要任何科技（为 `null`）。
+   - **断言 1**：木材消耗精准等于 `5`，科技要求为 `"石制工具"`。
    - 提取 IRON_PICKAXE (铁镐) 配方。
-   - **断言 2**：木材消耗为 `5`，铁矿为 `3`，且前置科技解锁标志必须是 `"IRON_FORGING"`。
+   - **断言 2**：木材消耗为 `5`，铁矿为 `3`，且前置科技解锁标志必须是 `"铁器锻造"`。
 2. **工房状态注册隔离与空值防御测试**：
    - 实例化 `WorkshopEngine`。
    - 尝试读取不存在的工房 ID `9999L` 的状态。

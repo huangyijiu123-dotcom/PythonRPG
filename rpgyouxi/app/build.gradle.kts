@@ -29,8 +29,22 @@ dependencies {
 
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3")
     testImplementation("io.mockk:mockk:1.13.8")
+    testImplementation("org.junit.platform:junit-platform-launcher:1.8.2")
 }
 
 tasks.test {
     useJUnitPlatform()
 }
+
+tasks.register("printTestClasspath") {
+    doLast {
+        val testRuntimeClasspath = project.extensions.getByType<SourceSetContainer>()["test"].runtimeClasspath
+        println("TEST_CLASSPATH=" + testRuntimeClasspath.asPath)
+    }
+}
+
+tasks.register<JavaExec>("runManualTests") {
+    mainClass.set("com.example.pythonrpg.engine.ManualTestRunnerKt")
+    classpath = project.extensions.getByType<SourceSetContainer>()["test"].runtimeClasspath
+}
+

@@ -18,6 +18,13 @@ public class BuildingEngine(
 
     // 十六大建筑的只读静态配置表
     public val buildingConfigs: Map<BuildingType, BuildingTypeConfig> = mapOf(
+        BuildingType.ROYAL_CASTLE to BuildingTypeConfig(
+            allowedTerrains = setOf("PLAINS"),
+            woodCost = 0,
+            stoneCost = 0,
+            maxLevel = 1,
+            baseConstructionTicks = 10
+        ),
         BuildingType.COTTAGE to BuildingTypeConfig(
             allowedTerrains = setOf("PLAINS"),
             woodCost = 30,
@@ -39,6 +46,76 @@ public class BuildingEngine(
             maxLevel = 5,
             baseConstructionTicks = 4
         ),
+        BuildingType.MINE to BuildingTypeConfig(
+            allowedTerrains = setOf("MOUNTAIN"),
+            woodCost = 30,
+            stoneCost = 30,
+            maxLevel = 5,
+            baseConstructionTicks = 4
+        ),
+        BuildingType.FARM to BuildingTypeConfig(
+            allowedTerrains = setOf("PLAINS"),
+            woodCost = 20,
+            stoneCost = 0,
+            maxLevel = 5,
+            baseConstructionTicks = 4
+        ),
+        BuildingType.ALCHEMY_LAB to BuildingTypeConfig(
+            allowedTerrains = setOf("SWAMP"),
+            woodCost = 40,
+            stoneCost = 30,
+            maxLevel = 5,
+            baseConstructionTicks = 10
+        ),
+        BuildingType.LOCAL_STORAGE to BuildingTypeConfig(
+            allowedTerrains = setOf("PLAINS", "FOREST", "MOUNTAIN", "TUNDRA", "SWAMP", "VOLCANO"),
+            woodCost = 0,
+            stoneCost = 50,
+            maxLevel = 5,
+            baseConstructionTicks = 10
+        ),
+        BuildingType.DISTRIBUTION to BuildingTypeConfig(
+            allowedTerrains = setOf("PLAINS", "FOREST", "MOUNTAIN", "TUNDRA", "SWAMP", "VOLCANO"),
+            woodCost = 0,
+            stoneCost = 200,
+            maxLevel = 5,
+            baseConstructionTicks = 10
+        ),
+        BuildingType.CARAVAN_POST to BuildingTypeConfig(
+            allowedTerrains = setOf("PLAINS"),
+            woodCost = 80,
+            stoneCost = 40,
+            maxLevel = 5,
+            baseConstructionTicks = 10
+        ),
+        BuildingType.BLACKSMITH to BuildingTypeConfig(
+            allowedTerrains = setOf("PLAINS"),
+            woodCost = 50,
+            stoneCost = 80,
+            maxLevel = 5,
+            baseConstructionTicks = 10
+        ),
+        BuildingType.TAVERN to BuildingTypeConfig(
+            allowedTerrains = setOf("PLAINS"),
+            woodCost = 60,
+            stoneCost = 40,
+            maxLevel = 5,
+            baseConstructionTicks = 10
+        ),
+        BuildingType.ACADEMY to BuildingTypeConfig(
+            allowedTerrains = setOf("PLAINS", "FOREST", "MOUNTAIN", "TUNDRA", "SWAMP", "VOLCANO"),
+            woodCost = 100,
+            stoneCost = 150,
+            maxLevel = 5,
+            baseConstructionTicks = 10
+        ),
+        BuildingType.WORKSHOP to BuildingTypeConfig(
+            allowedTerrains = setOf("PLAINS", "FOREST", "MOUNTAIN", "TUNDRA", "SWAMP", "VOLCANO"),
+            woodCost = 80,
+            stoneCost = 100,
+            maxLevel = 5,
+            baseConstructionTicks = 10
+        ),
         BuildingType.ICE_CELLAR to BuildingTypeConfig(
             allowedTerrains = setOf("TUNDRA"),
             woodCost = 0,
@@ -46,37 +123,13 @@ public class BuildingEngine(
             maxLevel = 3,
             baseConstructionTicks = 6
         ),
-        BuildingType.DISTRIBUTION to BuildingTypeConfig(
-            allowedTerrains = setOf("PLAINS", "FOREST"),
-            woodCost = 100,
-            stoneCost = 50,
+        BuildingType.FURNACE to BuildingTypeConfig(
+            allowedTerrains = setOf("VOLCANO"),
+            woodCost = 0,
+            stoneCost = 150,
             maxLevel = 5,
             baseConstructionTicks = 10
-        ),
-        BuildingType.LOCAL_STORAGE to BuildingTypeConfig(
-            allowedTerrains = setOf("PLAINS", "FOREST"),
-            woodCost = 100,
-            stoneCost = 50,
-            maxLevel = 5,
-            baseConstructionTicks = 10
-        ),
-        BuildingType.ROYAL_CASTLE to BuildingTypeConfig(
-            allowedTerrains = setOf("PLAINS", "FOREST"),
-            woodCost = 100,
-            stoneCost = 50,
-            maxLevel = 5,
-            baseConstructionTicks = 10
-        ),
-        // 对其余 9 种未特殊注明类型的建筑配置合理默认值，确保 100% 编译运行安全
-        BuildingType.MINE to BuildingTypeConfig(setOf("MOUNTAIN"), 50, 50, 5, 5),
-        BuildingType.FARM to BuildingTypeConfig(setOf("PLAINS"), 40, 10, 5, 4),
-        BuildingType.ALCHEMY_LAB to BuildingTypeConfig(setOf("PLAINS"), 60, 40, 5, 6),
-        BuildingType.CARAVAN_POST to BuildingTypeConfig(setOf("PLAINS", "FOREST"), 80, 40, 5, 8),
-        BuildingType.BLACKSMITH to BuildingTypeConfig(setOf("PLAINS"), 50, 50, 5, 5),
-        BuildingType.TAVERN to BuildingTypeConfig(setOf("PLAINS"), 70, 30, 5, 5),
-        BuildingType.ACADEMY to BuildingTypeConfig(setOf("PLAINS"), 100, 100, 5, 12),
-        BuildingType.WORKSHOP to BuildingTypeConfig(setOf("PLAINS"), 60, 60, 5, 6),
-        BuildingType.FURNACE to BuildingTypeConfig(setOf("MOUNTAIN", "PLAINS"), 80, 80, 5, 8)
+        )
     )
 
     /**
@@ -192,20 +245,7 @@ public class BuildingEngine(
         val upgradeTicks = config.baseConstructionTicks * (snap.level + 1)
         snap.state = BuildingState.UPGRADING
         snap.constructionProgress = 0
-        // 由于 maxConstructionProgress 是 val，如果需要改动我们需要把它作为 snapshot 的字段在模型中设为 var
-        // 顺应 SharedModels 中快照字段只读/可变习惯，我们在 BuildingModels 中已将其申明为 val
-        // 若 maxConstructionProgress 为 val，我们可以采用 copy 替换或直接将其改为 var。
-        // 为确保可直接修改属性，我们在 BuildingModels.kt 中将其定义为 val，我们可以用替换方式或直接修改。
-        // Wait, let's verify if BuildingModels.kt defined maxConstructionProgress as val.
-        // Yes: `val maxConstructionProgress: Int`
-        // Since it's a val, we cannot reassign it directly. But wait! Let's check how we can modify it.
-        // We can either change `BuildingModels.kt` to make it a `var`, or construct a new BuildingSnapshot.
-        // Let's modify BuildingModels.kt to make `state`, `level`, `constructionProgress` and `maxConstructionProgress` var!
-        // Wait, did we define them as val in BuildingModels.kt? Let's check:
-        // `var level: Int, var state: BuildingState, var constructionProgress: Int, val maxConstructionProgress: Int`
-        // Oh! `maxConstructionProgress` was indeed defined as `val`!
-        // Let's replace `BuildingModels.kt` to make `maxConstructionProgress` a `var` as well, to allow clean in-place modification!
-        // Yes, that is extremely clean and prevents any copying. Let's do that immediately using replace_file_content!
+        snap.maxConstructionProgress = upgradeTicks
         return true
     }
 
@@ -216,7 +256,7 @@ public class BuildingEngine(
         val snap = buildings[buildingId] ?: return
         snap.state = state
         snap.constructionProgress = progress
-        // Wait! If maxConstructionProgress is val, we can't write to it. Let's update BuildingModels.kt first to change it to var!
+        snap.maxConstructionProgress = maxProgress
     }
 
     /**

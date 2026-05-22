@@ -50,6 +50,7 @@ public class ActionProcessor {
 
     public fun setAutomationSystem(system: VillagerAutomationSystem) {
         this.automationSystem = system
+        system.eventPublisher = this::publishEvent
     }
 
     public fun processTick(

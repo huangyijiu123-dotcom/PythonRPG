@@ -71,11 +71,22 @@ data class BuildingSnapshot(
 
 ### 机械式步骤指令：
 1. **硬编码静态配置表字典配置**（在 `BuildingEngine` 内声明 `val buildingConfigs: Map<BuildingType, BuildingTypeConfig>`）：
-   - `COTTAGE` (民房)：地形为 `{"PLAINS"}`，木材 30，石材 0，上限 5 级，基础 3 Tick。
-   - `LUMBER_CAMP` (伐木场)：地形为 `{"FOREST"}`，木材 50，石材 0，上限 5 级，基础 4 Tick。
-   - `QUARRY` (采石场)：地形为 `{"MOUNTAIN"}`，木材 30，石材 20，上限 5 级，基础 4 Tick。
-   - `ICE_CELLAR` (冰窖仓库)：地形为 `{"TUNDRA"}`，木材 0，石材 100，上限 3 级，基础 6 Tick。
-   - 对于 `DISTRIBUTION`（分拨中心）、`LOCAL_STORAGE`（地方仓库）、`ROYAL_CASTLE`（王城）：地形允许为 `{"PLAINS", "FOREST"}`，木材 100，石材 50，上限 5 级，基础 10 Tick。其余未特殊注明类型默认配置合理数值。
+   - `ROYAL_CASTLE` (🏰 大本营王城)：地形为 `{"PLAINS"}`，木材 0，石材 0，上限 1 级（初始存在不可升级），基础 10 Tick。
+   - `COTTAGE` (🏠 民房)：地形为 `{"PLAINS"}`，木材 30，石材 0，上限 5 级，基础 3 Tick。
+   - `LUMBER_CAMP` (🪓 伐木场)：地形为 `{"FOREST"}`，木材 50，石材 0，上限 5 级，基础 4 Tick。
+   - `QUARRY` (⛏️ 采石场)：地形为 `{"MOUNTAIN"}`，木材 30，石材 20，上限 5 级，基础 4 Tick。
+   - `MINE` (⛏️ 采矿场)：地形为 `{"MOUNTAIN"}`，木材 30，石材 30，上限 5 级，基础 4 Tick。
+   - `FARM` (🌾 农田)：地形为 `{"PLAINS"}`，木材 20，石材 0，上限 5 级，基础 4 Tick。
+   - `ALCHEMY_LAB` (🧪 炼金工坊)：地形为 `{"SWAMP"}`，木材 40，石材 30，上限 5 级，基础 10 Tick。
+   - `LOCAL_STORAGE` (📦 地方物资仓库)：地形为 `{"PLAINS", "FOREST", "MOUNTAIN", "TUNDRA", "SWAMP", "VOLCANO"}`（任意地形），木材 0，石材 50，上限 5 级，基础 10 Tick。
+   - `DISTRIBUTION` (🏛️ 物流分拨中心)：地形为 `{"PLAINS", "FOREST", "MOUNTAIN", "TUNDRA", "SWAMP", "VOLCANO"}`（任意地形），木材 0，石材 200，上限 5 级，基础 10 Tick（由地方仓库升级，额外需要金币 100）。
+   - `CARAVAN_POST` (🏪 商队驿站)：地形为 `{"PLAINS"}`，木材 80，石材 40，上限 5 级，基础 10 Tick。
+   - `BLACKSMITH` (🔨 装备铁匠铺)：地形为 `{"PLAINS"}`，木材 50，石材 80，上限 5 级，基础 10 Tick。
+   - `TAVERN` (🍺 英雄酒馆)：地形为 `{"PLAINS"}`，木材 60，石材 40，上限 5 级，基础 10 Tick。
+   - `ACADEMY` (🏛️ 科学院)：地形为 `{"PLAINS", "FOREST", "MOUNTAIN", "TUNDRA", "SWAMP", "VOLCANO"}`（任意地形），木材 100，石材 150，上限 5 级，基础 10 Tick。
+   - `WORKSHOP` (🏭 生产工房)：地形为 `{"PLAINS", "FOREST", "MOUNTAIN", "TUNDRA", "SWAMP", "VOLCANO"}`（任意地形），木材 80，石材 100，上限 5 级，基础 10 Tick。
+   - `ICE_CELLAR` (🧊 冰窖仓库)：地形为 `{"TUNDRA"}`，木材 0，石材 100，上限 3 级，基础 6 Tick（额外需要永冻冰晶 10）。
+   - `FURNACE` (🔥 高温熔炉)：地形为 `{"VOLCANO"}`，木材 0，石材 150，上限 5 级，基础 10 Tick（额外需要黑曜石 5）。
 2. **构建高安全的并发存储容器**：
    - 实例化 `class BuildingEngine`。
    - 内部维护并发安全的建筑物容器字典及唯一 ID 原子发生器：
